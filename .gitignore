@@ -6,3 +6,22 @@
 /sweep_results.csv
 /*.csv
 /.idea
+
+# secrets
+.env
+.env.*
+*.key
+*.pem
+*.cbor
+*.skey
+*.vkey
+
+# bot artifacts
+fills.csv
+band-center.json
+.band-center.json
+*.csv
+
+# node
+node_modules
+dist
