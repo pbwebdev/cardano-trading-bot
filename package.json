@@ -1,0 +1,29 @@
+{
+  "name": "cardano-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "",
+  "main": "index.js",
+  "license": "ISC",
+  "scripts": {
+    "gen": "tsx src/gen-key.ts",
+    "bot": "tsx src/bot-minswap.ts"
+  },
+  "dependencies": {
+    "@blockfrost/blockfrost-js": "^6.0.0",
+    "@emurgo/cardano-serialization-lib-nodejs": "15.0.1",
+    "@minswap/sdk": "^0.3.4",
+    "@noble/hashes": "^2.0.0",
+    "axios": "1.11.0",
+    "bech32": "2.0.0",
+    "blakejs": "^1.2.1",
+    "dotenv": "17.2.2",
+    "lucid-cardano": "0.10.11"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.1",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}

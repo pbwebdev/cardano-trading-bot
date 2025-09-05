@@ -1,0 +1,8 @@
+/node_modules/
+/.env
+/.band-center.json
+/backtest_trades.csv
+/fills.csv
+/sweep_results.csv
+/*.csv
+/.idea
