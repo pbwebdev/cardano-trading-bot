@@ -6,6 +6,8 @@
 /sweep_results.csv
 /*.csv
 /.idea
+logs/
+/logs/
 
 # secrets
 .env
