@@ -13,17 +13,19 @@ type Net = "Mainnet" | "Preprod" | "Preview";
 const NETWORK = (process.env.NETWORK ?? "Mainnet") as Net;
 const AGG = "https://agg-api.minswap.org/aggregator";
 
+// Pair & sizing
 const TOKEN_A_Q = (process.env.TOKEN_A ?? "ADA").trim();
 const TOKEN_B_Q = (process.env.TOKEN_B ?? "MIN").trim();
-
 const AMOUNT_A_DEC = (process.env.AMOUNT_A_DEC ?? "10").trim();   // sell A (human units)
 const AMOUNT_B_DEC = (process.env.AMOUNT_B_DEC ?? "100").trim();  // sell B (human units)
 
+// Numeric env helper
 function num(env: string | undefined, fallback: number) {
     const n = Number(env);
     return Number.isFinite(n) ? n : fallback;
 }
 
+// Strategy
 const SLIPPAGE_PCT = num(process.env.SLIPPAGE_PCT, 0.5);
 const FEE_CAP_PCT  = num(process.env.FEE_CAP_PCT, 0.20);
 
@@ -35,11 +37,17 @@ const EDGE_BPS    = num(process.env.EDGE_BPS, 5);           // extra distance be
 const COOLDOWN_MS = num(process.env.COOLDOWN_MS, 45000);    // throttle after a fill
 const POLL_MS     = num(process.env.POLL_MS, 60000);
 
+// Guards
+const MIN_NOTIONAL_OUT = num(process.env.MIN_NOTIONAL_OUT, 0); // skip if out < this (human units)
+const RESERVE_ADA_DEC  = num(process.env.RESERVE_ADA_DEC, 0);  // keep at least this many ADA
+
+// Runtime
 const DRY_RUN   = (process.env.DRY_RUN ?? "true").toLowerCase() === "true";
 const ONLY_VERI = (process.env.ONLY_VERIFIED ?? "true").toLowerCase() === "true";
 
-const LOG = path.join(process.cwd(), "fills.csv");
-const CENTER_FILE = path.join(process.cwd(), ".band-center.json");
+// Logs
+const LOG = path.join(process.cwd(), process.env.LOG ?? "fills.csv");
+const CENTER_FILE = path.join(process.cwd(), process.env.CENTER_FILE ?? ".band-center.json");
 
 // ----- persist EMA center -----
 function loadCenter(): number | null {
@@ -62,7 +70,7 @@ if (!fs.existsSync(LOG)) {
 function blockfrostBase(net: Net) {
     return net === "Mainnet" ? "https://cardano-mainnet.blockfrost.io/api/v0"
         : net === "Preprod"   ? "https://cardano-preprod.blockfrost.io/api/v0"
-            :                       "https://cardano-preview.blockfrost.io/api/v0";
+            :                           "https://cardano-preview.blockfrost.io/api/v0";
 }
 
 async function makeLucid() {
@@ -142,11 +150,49 @@ async function estimate(fromUnit: string, toUnit: string, amountDecimal: string)
     return { req, res };
 }
 
+// Normalize min_amount_out to **integer** base units (string) for build-tx
+function normalizeMinOut(estRes: any): string {
+    const candidates = [
+        estRes.min_amount_out,
+        estRes.min_amount_out_units,
+        estRes.min_amount_out_onchain,
+        estRes.amount_out_min,
+    ].filter((v) => v !== undefined && v !== null);
+
+    if (candidates.length === 0) {
+        throw new Error("estimate response missing min_amount_out");
+    }
+
+    let raw = String(candidates[0]);
+    if (!raw.includes(".")) return raw; // already integer
+
+    const decimals = Number(estRes.token_out_decimals ?? estRes.decimals_out ?? estRes.decimals ?? 0);
+    const val = Number(raw);
+    if (!Number.isFinite(val)) throw new Error(`min_amount_out not a number: ${raw}`);
+    const scaled = Math.floor(val * Math.pow(10, decimals));
+    return BigInt(scaled).toString();
+}
+
+// Convert min_amount_out (on-chain integer or decimal) to **human units** for PnL
+function humanMinOut(estRes: any): number {
+    if (estRes.min_amount_out_human !== undefined) return Number(estRes.min_amount_out_human);
+
+    const raw = estRes.min_amount_out ?? estRes.min_amount_out_units ?? estRes.amount_out_min;
+    if (raw === undefined || raw === null) throw new Error("estimate missing min_amount_out");
+
+    const s = String(raw);
+    if (s.includes(".")) return Number(s); // already human
+
+    const decimals = Number(estRes.token_out_decimals ?? estRes.decimals_out ?? estRes.decimals ?? 0);
+    return Number(BigInt(s)) / Math.pow(10, decimals);
+}
+
 async function executeSwap(sender: string, estReq: any, estRes: any): Promise<string> {
+    const minOutFixed = normalizeMinOut(estRes);
     const build = (await axios.post(`${AGG}/build-tx`, {
         sender,
-        min_amount_out: estRes.min_amount_out,
-        estimate: { ...estReq, ...estRes }
+        min_amount_out: minOutFixed,
+        estimate: { ...estReq, ...estRes },
     })).data;
 
     const unsignedCborHex: string = build.cbor;
@@ -154,7 +200,7 @@ async function executeSwap(sender: string, estReq: any, estRes: any): Promise<st
 
     const finalized = (await axios.post(`${AGG}/finalize-and-submit-tx`, {
         cbor: unsignedCborHex,
-        witness_set: witnessHex
+        witness_set: witnessHex,
     })).data;
 
     return finalized.tx_id;
@@ -165,7 +211,7 @@ function logFill(
     side: "SELL_A" | "SELL_B",
     amountIn: string,
     tokenIn: string,
-    minOut: string,
+    minOutHuman: string,     // logged in human units for readability
     tokenOut: string,
     tx: string,
     midAtFill: number,
@@ -176,7 +222,7 @@ function logFill(
         side,
         amountIn,
         tokenIn,
-        minOut,
+        minOutHuman,
         tokenOut,
         tx,
         midAtFill.toFixed(8),
@@ -201,7 +247,7 @@ function bounds(center: number, bps: number) {
 }
 function bpsOver(x: number, y: number) { return ((x - y) / y) * 10000; }
 
-let centerGlobal: number | null = null;  // <-- for SIGINT
+let centerGlobal: number | null = null;  // for SIGINT persistence
 
 async function main() {
     const lucid = await makeLucid();
@@ -232,30 +278,28 @@ async function main() {
             const amtA = Number(AMOUNT_A_DEC);
             const amtB = Number(AMOUNT_B_DEC);
 
-            // quotes both ways (human-sized)
+            // 1) Quotes both ways (human-sized)
             const [{ req: reqAB, res: resAB }, { req: reqBA, res: resBA }] = await Promise.all([
                 estimate(unitA, unitB, AMOUNT_A_DEC),
-                estimate(unitB, unitA, AMOUNT_B_DEC)
+                estimate(unitB, unitA, AMOUNT_B_DEC),
             ]);
 
-            const minOutAB = parseFloat(String(resAB.min_amount_out ?? "0"));
-            const minOutBA = parseFloat(String(resBA.min_amount_out ?? "0"));
+            const minOutAB = Number(resAB.min_amount_out);
+            const minOutBA = Number(resBA.min_amount_out);
             if (!Number.isFinite(minOutAB) || !Number.isFinite(minOutBA)) {
                 throw new Error(`Bad min_amount_out: A->B=${resAB.min_amount_out} B->A=${resBA.min_amount_out}`);
             }
 
-            // optional notional guard (in token_out human units)
-            const MIN_NOTIONAL_OUT = Number.isFinite(Number(process.env.MIN_NOTIONAL_OUT))
-                ? Number(process.env.MIN_NOTIONAL_OUT)
-                : 0;
+            // Optional notional guard (in token_out human units)
             const smallAB = MIN_NOTIONAL_OUT > 0 && minOutAB < MIN_NOTIONAL_OUT;
             const smallBA = MIN_NOTIONAL_OUT > 0 && minOutBA < MIN_NOTIONAL_OUT;
             if (smallAB) console.log(`[guard] A->B min_out ${minOutAB} < ${MIN_NOTIONAL_OUT} — holding`);
             if (smallBA) console.log(`[guard] B->A min_out ${minOutBA} < ${MIN_NOTIONAL_OUT} — holding`);
 
-            const mid = deriveMid(minOutAB, minOutBA, amtA, amtB); // TOKEN_B per TOKEN_A
+            // 2) Mid price (TOKEN_B per TOKEN_A)
+            const mid = deriveMid(minOutAB, minOutBA, amtA, amtB);
 
-            // init / update EMA center
+            // 3) EMA center update
             if (!Number.isFinite(center)) {
                 center = mid;
                 console.log(`[init] band center set to first mid: ${center.toFixed(8)} ${TOKEN_B_Q}/${TOKEN_A_Q}`);
@@ -270,68 +314,57 @@ async function main() {
                 `[tick] mid≈ ${mid.toFixed(8)} ${TOKEN_B_Q}/${TOKEN_A_Q} | band [${lower.toFixed(8)}, ${upper.toFixed(8)}] | center≈ ${center.toFixed(8)}`
             );
 
-            // decide action with edge distance
+            // 4) Decide action
             let action: "SELL_A" | "SELL_B" | "HOLD" = "HOLD";
             const overUpperBps = bpsOver(mid, upper);
             const underLowerBps = bpsOver(lower, mid);
-
             if (mid > upper && overUpperBps >= EDGE_BPS) action = "SELL_A";
             else if (mid < lower && underLowerBps >= EDGE_BPS) action = "SELL_B";
 
             if (action === "HOLD" || (action === "SELL_A" && smallAB) || (action === "SELL_B" && smallBA)) {
-                await new Promise(r => setTimeout(r, POLL_MS));
+                await new Promise((r) => setTimeout(r, POLL_MS));
                 continue;
             }
 
-            // cooldown (show remaining time)
+            // 5) Cooldown (show remaining time)
             if (!DRY_RUN) {
                 const delta = Date.now() - lastTradeAt;
                 const remain = COOLDOWN_MS - delta;
                 if (remain > 0) {
                     console.log(`[cooldown] ${Math.max(0, remain)}ms remaining`);
-                    await new Promise(r => setTimeout(r, Math.min(POLL_MS, remain)));
+                    await new Promise((r) => setTimeout(r, Math.min(POLL_MS, remain)));
                     continue;
                 }
             }
 
-            // balance checks (only for the side we sell)
+            // 6) Balance checks + reserve ADA guard (SELL_A only)
             if (action === "SELL_A") {
                 if (unitA === "lovelace") {
-                    const buf = 2_000_000n;
-                    const required = BigInt(Math.round(amtA * 1_000_000)) + buf;
+                    const buf = 2_000_000n; // fee buffer
                     const adaBal = await getAdaBalance(lucid);
+                    const sellAdaLovelace = BigInt(Math.round(amtA * 1_000_000));
+                    const reserveLovelace  = BigInt(Math.round(RESERVE_ADA_DEC * 1_000_000));
+
+                    // keep ≥ reserve + fees AFTER selling
+                    if (adaBal - sellAdaLovelace < reserveLovelace + buf) {
+                        console.log(`[guard] reserve: keep ≥ ${RESERVE_ADA_DEC} ADA + fees; holding`);
+                        await new Promise((r) => setTimeout(r, POLL_MS));
+                        continue;
+                    }
+
+                    const required = sellAdaLovelace + buf;
                     if (adaBal < required) {
                         console.warn("Not enough ADA to sell A");
-                        await new Promise(r => setTimeout(r, POLL_MS));
+                        await new Promise((r) => setTimeout(r, POLL_MS));
                         continue;
                     }
                 } else {
                     const balA = await getBalanceUnit(lucid, unitA);
                     if (balA <= 0n) {
                         console.warn("No TOKEN_A balance");
-                        await new Promise(r => setTimeout(r, POLL_MS));
+                        await new Promise((r) => setTimeout(r, POLL_MS));
                         continue;
                     }
-                }
-
-                console.log(`ACTION: SELL_A ${AMOUNT_A_DEC} ${TOKEN_A_Q} → ${TOKEN_B_Q} (edge+${overUpperBps.toFixed(2)}bps)`);
-
-                if (DRY_RUN) {
-                    console.log("[dry-run] skipping trade");
-                } else {
-                    const tx = await executeSwap(sender, reqAB, resAB);
-                    console.log("Submitted:", tx);
-
-                    // Realized PnL in ADA at decision mid:
-                    // SELL_A: spent amtA ADA, received minOut_B; value in ADA ≈ (minOut_B / mid)
-                    const amtA_num = Number(AMOUNT_A_DEC);
-                    const minOutB_num = Number(resAB.min_amount_out);
-                    const pnlADA = (minOutB_num / mid) - amtA_num;
-
-                    console.log(`PnL (SELL_A): ${pnlADA.toFixed(6)} ADA @ mid ${mid.toFixed(8)}`);
-                    logFill("SELL_A", AMOUNT_A_DEC, TOKEN_A_Q, String(resAB.min_amount_out), TOKEN_B_Q, tx, mid, pnlADA);
-
-                    lastTradeAt = Date.now();
                 }
             } else if (action === "SELL_B") {
                 if (unitB === "lovelace") {
@@ -340,47 +373,68 @@ async function main() {
                     const adaBal = await getAdaBalance(lucid);
                     if (adaBal < required) {
                         console.warn("Not enough ADA to sell B");
-                        await new Promise(r => setTimeout(r, POLL_MS));
+                        await new Promise((r) => setTimeout(r, POLL_MS));
                         continue;
                     }
                 } else {
                     const balB = await getBalanceUnit(lucid, unitB);
                     if (balB <= 0n) {
                         console.warn("No TOKEN_B balance");
-                        await new Promise(r => setTimeout(r, POLL_MS));
+                        await new Promise((r) => setTimeout(r, POLL_MS));
                         continue;
                     }
                 }
+            }
 
+            // 7) Execute + PnL log
+            if (action === "SELL_A") {
+                console.log(`ACTION: SELL_A ${AMOUNT_A_DEC} ${TOKEN_A_Q} → ${TOKEN_B_Q} (edge+${overUpperBps.toFixed(2)}bps)`);
+                if (DRY_RUN) {
+                    console.log("[dry-run] skipping trade");
+                } else {
+                    const tx = await executeSwap(sender, reqAB, resAB);
+                    console.log("Submitted:", tx);
+
+                    // PnL in ADA at decision mid:
+                    // Received B (human) -> ADA value ≈ B / mid; minus ADA spent
+                    const amtA_num = Number(AMOUNT_A_DEC);
+                    const minOutB_human = humanMinOut(resAB);
+                    const pnlADA = (minOutB_human / mid) - amtA_num;
+
+                    console.log(`PnL (SELL_A): ${pnlADA.toFixed(6)} ADA @ mid ${mid.toFixed(8)}`);
+                    logFill("SELL_A", AMOUNT_A_DEC, TOKEN_A_Q, String(minOutB_human), TOKEN_B_Q, tx, mid, pnlADA);
+
+                    lastTradeAt = Date.now();
+                }
+            } else if (action === "SELL_B") {
                 console.log(`ACTION: SELL_B ${AMOUNT_B_DEC} ${TOKEN_B_Q} → ${TOKEN_A_Q} (edge+${underLowerBps.toFixed(2)}bps)`);
-
                 if (DRY_RUN) {
                     console.log("[dry-run] skipping trade");
                 } else {
                     const tx = await executeSwap(sender, reqBA, resBA);
                     console.log("Submitted:", tx);
 
-                    // Realized PnL in ADA at decision mid:
-                    // SELL_B: received minOut_A ADA, sold amtB B; value sold ≈ (amtB / mid) ADA
+                    // PnL in ADA at decision mid:
+                    // Received ADA (human) minus ADA-equivalent of B sold
                     const amtB_num = Number(AMOUNT_B_DEC);
-                    const minOutA_num = Number(resBA.min_amount_out);
-                    const pnlADA = minOutA_num - (amtB_num / mid);
+                    const minOutA_human = humanMinOut(resBA);
+                    const pnlADA = minOutA_human - (amtB_num / mid);
 
                     console.log(`PnL (SELL_B): ${pnlADA.toFixed(6)} ADA @ mid ${mid.toFixed(8)}`);
-                    logFill("SELL_B", AMOUNT_B_DEC, TOKEN_B_Q, String(resBA.min_amount_out), TOKEN_A_Q, tx, mid, pnlADA);
+                    logFill("SELL_B", AMOUNT_B_DEC, TOKEN_B_Q, String(minOutA_human), TOKEN_A_Q, tx, mid, pnlADA);
 
                     lastTradeAt = Date.now();
                 }
             }
 
-            await new Promise(r => setTimeout(r, POLL_MS));
+            await new Promise((r) => setTimeout(r, POLL_MS));
         } catch (e: any) {
             if (axios.isAxiosError(e)) {
                 console.error("HTTP", e.response?.status, e.response?.data ?? e.message);
             } else {
                 console.error(e?.message ?? e);
             }
-            await new Promise(r => setTimeout(r, POLL_MS));
+            await new Promise((r) => setTimeout(r, POLL_MS));
         }
     }
 }
