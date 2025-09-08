@@ -5,132 +5,107 @@ import path from "node:path";
 import axios from "axios";
 
 /**
- * Parameter sweep backtest aligned with bot-twoway + backtest-taptools:
- * - mid = TOKEN_B per TOKEN_A
- * - EMA(BAND_ALPHA), BAND_BPS, EDGE_BPS, MIN_NOTIONAL_OUT guard
- * - Optional cooldown per combo
- * - Fees modeled via BT_POOL_FEE_BPS + BT_AGG_FEE_BPS
- * - Reads sweep lists from env (comma-separated)
+ * Grid-sweeps EMA-band strategy with dynamic, balance-aware sizing to mirror src/bot-twoway.ts.
+ * - Reuses TapTools candles for all runs
+ * - Sizing: % of inventory with floors, ADA reserve, and fixed caps (AMOUNT_*_DEC)
+ * - Outputs per-run summary to sweep_results.csv
  */
 
 type Net = "Mainnet" | "Preprod" | "Preview";
 const NETWORK = (process.env.NETWORK ?? "Mainnet") as Net;
 
-// Pair
+// Pair & data source
 const TOKEN_A_Q = (process.env.TOKEN_A ?? "ADA").trim();
 const TOKEN_B_Q = (process.env.TOKEN_B ?? "USDM").trim();
-const ONLY_VERIFIED = (process.env.ONLY_VERIFIED ?? "true").toLowerCase() === "true";
 
-// TapTools
-const TAP_BASE = (process.env.TAPTOOLS_BASE ?? "https://openapi.taptools.io").trim();
-const TAP_KEY = process.env.TAPTOOLS_API_KEY!;
-const INTERVAL = (process.env.BT_INTERVAL ?? "1h").trim();
-const MAX_CANDLES = num(process.env.BT_MAX_POINTS, 1500);
-const START_EPOCH = num(process.env.BT_START_EPOCH, 0); // ms
-const END_EPOCH = num(process.env.BT_END_EPOCH, 0);     // ms
+const TAP_BASE     = (process.env.TAPTOOLS_BASE ?? "https://openapi.taptools.io").trim();
+const TAP_KEY      = process.env.TAPTOOLS_API_KEY!;
+const INTERVAL     = (process.env.BT_INTERVAL ?? "1h").trim();
+const MAX_CANDLES  = num(process.env.BT_MAX_POINTS, 3000);
+const START_EPOCH  = num(process.env.BT_START_EPOCH, 0); // ms epoch
+const END_EPOCH    = num(process.env.BT_END_EPOCH, 0);
 const PRICE_IS_B_PER_A = (process.env.BT_PRICE_IS_B_PER_A ?? "true").toLowerCase() === "true";
 
-// Fees
-const POOL_FEE_BPS = num(process.env.BT_POOL_FEE_BPS, 30);
+// Fees (bps)
+const POOL_FEE_BPS      = num(process.env.BT_POOL_FEE_BPS, 30);
 const EXTRA_AGG_FEE_BPS = num(process.env.BT_AGG_FEE_BPS, 0);
+const TOTAL_FEE_BPS     = POOL_FEE_BPS + EXTRA_AGG_FEE_BPS;
 
-// Starting balances (human units)
-const START_A = num(process.env.BT_START_ADA, 1000);
+// Caps (human)
+const CAP_A = num(process.env.AMOUNT_A_DEC, 10);
+const CAP_B = num(process.env.AMOUNT_B_DEC, 100);
+
+// Start balances (human)
+const START_A = num(process.env.BT_START_ADA, 100);
 const START_B = num(process.env.BT_START_TOKB, 0);
 
-// Sweeps (comma-separated lists)
-const BAND_BPS_LIST = listNum(process.env.SWEEP_BAND_BPS ?? "80,120,160");
-const ALPHA_LIST = listNum(process.env.SWEEP_BAND_ALPHA ?? "0.04,0.06,0.08");
-const EDGE_LIST = listNum(process.env.SWEEP_EDGE_BPS ?? "15,25,35");
-const AMT_A_LIST = listNum(process.env.SWEEP_AMOUNT_A_DEC ?? "25,50");
-const AMT_B_LIST = listNum(process.env.SWEEP_AMOUNT_B_DEC ?? "25,50");
+// Guards & misc
+const MIN_NOTIONAL_OUT = num(process.env.MIN_NOTIONAL_OUT, 0);
+const RESERVE_ADA_DEC  = num(process.env.RESERVE_ADA_DEC, 0);
+const FEE_BUF_ADA      = 2; // small fee headroom
+const ONLY_VERIFIED    = (process.env.ONLY_VERIFIED ?? "true").toLowerCase() === "true";
 
-// Optional sweeps
-const MIN_NOTIONAL_LIST = listNum(process.env.SWEEP_MIN_NOTIONAL_OUT ?? "0");   // human units of token_out
-const COOL_MS_LIST = listNum(process.env.SWEEP_BT_COOLDOWN_MS ?? "0");          // ms
+// Sweep ranges (comma/space separated)
+const BAND_BPS_LIST    = parseList(process.env.SWEEP_BAND_BPS, [50]);
+const EDGE_BPS_LIST    = parseList(process.env.SWEEP_EDGE_BPS, [5]);
+const ALPHA_LIST       = parseList(process.env.SWEEP_ALPHA, [0.10]);
+const MAX_PCT_A_LIST   = parseList(process.env.SWEEP_MAX_PCT_A, [10, 15, 20]);
+const MAX_PCT_B_LIST   = parseList(process.env.SWEEP_MAX_PCT_B, [10, 15, 20]);
+const MIN_TR_A_LIST    = parseList(process.env.SWEEP_MIN_TRADE_A, [5]);
+const MIN_TR_B_LIST    = parseList(process.env.SWEEP_MIN_TRADE_B, [50]);
+const COOLDOWN_LIST    = parseList(process.env.SWEEP_COOLDOWN_MS, [0]); // mirror bot throttle (ms)
 
-// Output
 const OUT = path.join(process.cwd(), "sweep_results.csv");
-ensureCsvHeader(
+ensureHeader(
     OUT,
     [
-        "band_bps",
-        "alpha",
-        "edge_bps",
-        "amount_a",
-        "amount_b",
-        "min_notional_out",
-        "cooldown_ms",
-        "trades",
-        "end_marked_ada",
-        "pnl_ada_abs",
-        "pnl_ada_pct",
-        "max_drawdown_pct",
-        "sharpe_like",
-        "winrate_pct",
-        "avg_trade_pnl_ada",
-        "median_trade_pnl_ada",
+        "ts_run","interval","points",
+        "token_a","token_b",
+        "band_bps","edge_bps","alpha",
+        "max_pct_a","max_pct_b","min_tr_a","min_tr_b",
+        "cap_a","cap_b","reserve_ada","pool_fee_bps","agg_fee_bps","cooldown_ms",
+        "start_a","start_b",
+        "end_a","end_b","end_marked_ada","pnl_ada","max_dd_ada",
+        "trades","sell_a","sell_b","wins","losses","winrate","avg_pnl_trade"
     ].join(",") + "\n"
 );
 
+// Aggregator (for token unit lookup)
 const AGG = "https://agg-api.minswap.org/aggregator";
 
-/* ----------------- helpers ----------------- */
+/* ---------- helpers ---------- */
 function num(x: any, def: number): number {
     const n = Number(x);
     return Number.isFinite(n) ? n : def;
 }
-function listNum(s: string): number[] {
-    return s
-        .split(",")
-        .map((x) => x.trim())
-        .filter(Boolean)
-        .map((x) => Number(x))
-        .filter((n) => Number.isFinite(n));
+function parseList(s: string | undefined, def: number[]): number[] {
+    if (!s) return def;
+    const parts = s.split(/[,\s]+/).map(v => v.trim()).filter(Boolean).map(Number).filter(Number.isFinite);
+    return parts.length ? parts : def;
 }
 function isUnit(u: string) {
     return /^[0-9a-f]{56}\.[0-9a-f]+$/i.test(u);
 }
-function ensureCsvHeader(file: string, header: string) {
+function ensureHeader(file: string, header: string) {
     if (!fs.existsSync(file)) fs.writeFileSync(file, header, "utf8");
 }
-function appendCsv(file: string, row: any[]) {
-    fs.appendFileSync(file, row.join(",") + "\n", "utf8");
+function appendCsv(file: string, row: (string|number)[]) {
+    fs.appendFileSync(file, row.join(",") + "\n");
 }
-function bpsOver(x: number, y: number) {
-    return ((x - y) / y) * 10000;
-}
+function bpsOver(x: number, y: number) { return ((x - y) / y) * 10000; }
 function bounds(center: number, bps: number) {
     return { lower: center * (1 - bps / 10000), upper: center * (1 + bps / 10000) };
 }
 function applyFeesOut(amountOut: number, totalFeeBps: number) {
     return amountOut * (1 - totalFeeBps / 10000);
 }
-function normalizeTs(x: number) {
-    if (!Number.isFinite(x)) return Date.now();
-    return String(x).length < 13 ? x * 1000 : x;
-}
-function percentile(arr: number[], p: number) {
-    if (!arr.length) return 0;
-    const a = [...arr].sort((x, y) => x - y);
-    const idx = Math.floor((p / 100) * (a.length - 1));
-    return a[idx];
-}
-function median(arr: number[]) {
-    return percentile(arr, 50);
-}
-function mean(arr: number[]) {
-    if (!arr.length) return 0;
-    return arr.reduce((s, v) => s + v, 0) / arr.length;
-}
-function stddev(arr: number[]) {
-    if (arr.length < 2) return 0;
-    const m = mean(arr);
-    const v = mean(arr.map((x) => (x - m) ** 2));
-    return Math.sqrt(v);
+function fix(x: any, d: number) {
+    const n = Number(x);
+    if (!Number.isFinite(n)) return String(x);
+    return n.toFixed(d);
 }
 
-/** Resolve a token via Minswap Agg (like bot). */
+/** Resolve a token unit via Minswap Aggregator (like live bot/backtest). */
 async function resolveTokenId(query: string): Promise<string> {
     if (query.toUpperCase() === "ADA") return "lovelace";
     if (isUnit(query)) return query;
@@ -144,17 +119,17 @@ async function resolveTokenId(query: string): Promise<string> {
     return chosen.token_id;
 }
 
-type Candle = { ts: number; open: number; high: number; low: number; close: number; volume?: number };
+type Candle = { ts: number; close: number };
 
-/** Fetch candles once for B quoted vs A (prefer ADA=lovelace). */
 async function fetchCandlesTapTools(params: {
-    unitBase: string; // TOKEN_B unit
-    vsUnit: string;   // quote denom (TOKEN_A unit)
+    unitBase: string;  // TOKEN_B unit
+    vsUnit: string;    // quote denominator (ADA=lovelace) for B/A series
     interval: string;
     limit: number;
-    start?: number; // ms
-    end?: number;   // ms
+    start?: number;
+    end?: number;
 }): Promise<Candle[]> {
+    if (!TAP_KEY) throw new Error("Missing TAPTOOLS_API_KEY");
     const PATH = "/api/v1/token/ohlcv";
     const q: Record<string, any> = {
         unit: params.unitBase,
@@ -164,7 +139,7 @@ async function fetchCandlesTapTools(params: {
         limit: params.limit,
     };
     if (params.start && params.start > 0) q.start = Math.floor(params.start / 1000);
-    if (params.end && params.end > 0) q.end = Math.floor(params.end / 1000);
+    if (params.end && params.end > 0)     q.end   = Math.floor(params.end / 1000);
 
     const url = `${TAP_BASE}${PATH}`;
     const resp = await axios.get(url, {
@@ -173,171 +148,166 @@ async function fetchCandlesTapTools(params: {
     });
     const raw = resp.data?.data ?? resp.data;
     if (!Array.isArray(raw) || raw.length === 0) {
-        throw new Error("No candle data from TapTools; check unit/interval/window.");
+        throw new Error("No candle data returned from TapTools (check unit/interval/time window).");
     }
-    const candles: Candle[] = raw
-        .map((k: any) => ({
-            ts: normalizeTs(k.ts ?? k.time ?? k.timestamp),
-            open: Number(k.open ?? k.o),
-            high: Number(k.high ?? k.h),
-            low: Number(k.low ?? k.l),
-            close: Number(k.close ?? k.c),
-            volume: k.volume ?? k.v,
-        }))
-        .filter((c) => Number.isFinite(c.close));
-    return candles;
+    return raw
+        .map((k: any) => {
+            const ts = normalizeTs(k.ts ?? k.time ?? k.timestamp);
+            const close = Number(k.close ?? k.c);
+            return { ts, close };
+        })
+        .filter((c: Candle) => Number.isFinite(c.close));
+}
+function normalizeTs(x: number) {
+    if (!Number.isFinite(x)) return Date.now();
+    return String(x).length < 13 ? x * 1000 : x;
 }
 
-/* -------------- core sim (one combo) -------------- */
-type Combo = {
-    bandBps: number;
-    alpha: number;
-    edgeBps: number;
-    amountA: number;
-    amountB: number;
-    minNotionalOut: number;
-    cooldownMs: number;
-};
-type SimResult = {
-    trades: number;
-    endMarkedAda: number;
-    pnlAbs: number;
-    pnlPct: number;
-    maxDDPct: number;
-    sharpeLike: number;
-    winratePct: number;
-    avgTradePnlAda: number;
-    medianTradePnlAda: number;
-};
+/* ---------- dynamic sizing used in the sweep ---------- */
+function computeDynamicSizesFromInventory(
+    invA: number, invB: number, aIsAda: boolean,
+    caps: { capA: number; capB: number },
+    sizing: { maxPctA: number; maxPctB: number; minTrA: number; minTrB: number }
+): { sizeA: number; sizeB: number } {
 
-function runCombo(series: { t: number; mid: number }[], combo: Combo): SimResult {
+    let maxSpendA = invA;
+    if (aIsAda) {
+        maxSpendA = Math.max(0, invA - RESERVE_ADA_DEC - FEE_BUF_ADA);
+    }
+
+    const dynA = (sizing.maxPctA / 100) * maxSpendA;
+    const dynB = (sizing.maxPctB / 100) * invB;
+
+    const sizeA = Math.min(invA, clamp(dynA, sizing.minTrA, caps.capA));
+    const sizeB = Math.min(invB, clamp(dynB, sizing.minTrB, caps.capB));
+
+    return { sizeA, sizeB };
+}
+function clamp(n: number, lo: number, hi: number) {
+    return Math.max(lo, Math.min(hi, n));
+}
+
+/* ---------- single run over a fixed series ---------- */
+type SeriesPoint = { t: number; mid: number };
+
+function runBacktest(
+    series: SeriesPoint[],
+    params: {
+        bandBps: number; alpha: number; edgeBps: number; cooldownMs: number;
+        capA: number; capB: number;
+        maxPctA: number; maxPctB: number; minTrA: number; minTrB: number;
+        aIsAda: boolean;
+    }
+) {
     let invA = START_A;
     let invB = START_B;
-    const feeBps = POOL_FEE_BPS + EXTRA_AGG_FEE_BPS;
-
     let center = series[0].mid;
     let lastTradeAt = 0;
 
-    const tradePnLs: number[] = [];
-    const rolling: number[] = []; // marked ADA equity curve
+    let trades = 0, sellA = 0, sellB = 0, wins = 0, losses = 0;
+    let peakMarked = invA + (invB / series[0].mid);
+    let maxDD = 0;
 
     for (const { t, mid } of series) {
-        // Update EMA center
-        center = combo.alpha * mid + (1 - combo.alpha) * center;
-        const { lower, upper } = bounds(center, combo.bandBps);
+        center = params.alpha * mid + (1 - params.alpha) * center;
+        const { lower, upper } = bounds(center, params.bandBps);
 
-        // Decide like bot
         let action: "HOLD" | "SELL_A" | "SELL_B" = "HOLD";
         const overUpper = bpsOver(mid, upper);
         const underLower = bpsOver(lower, mid);
-        if (mid > upper && overUpper >= combo.edgeBps) action = "SELL_A";
-        else if (mid < lower && underLower >= combo.edgeBps) action = "SELL_B";
+        if (mid > upper && overUpper >= params.edgeBps) action = "SELL_A";
+        else if (mid < lower && underLower >= params.edgeBps) action = "SELL_B";
 
-        // Cooldown
-        if (action !== "HOLD" && combo.cooldownMs > 0) {
-            const remain = combo.cooldownMs - (t - lastTradeAt);
+        if (action !== "HOLD" && params.cooldownMs > 0) {
+            const remain = params.cooldownMs - (t - lastTradeAt);
             if (remain > 0) action = "HOLD";
         }
 
-        if (action === "SELL_A") {
-            if (invA < combo.amountA) {
-                rolling.push(invA + invB / mid);
-                continue;
-            }
-            const rawOutB = mid * combo.amountA;
-            if (combo.minNotionalOut > 0 && rawOutB < combo.minNotionalOut) {
-                rolling.push(invA + invB / mid);
-                continue;
-            }
-            const outB = applyFeesOut(rawOutB, feeBps);
-            const pnlAda = (outB / mid) - combo.amountA;
+        if (action === "HOLD") {
+            const marked = invA + (invB / mid);
+            peakMarked = Math.max(peakMarked, marked);
+            maxDD = Math.max(maxDD, peakMarked - marked);
+            continue;
+        }
 
-            invA -= combo.amountA;
+        // Dynamic size based on current inventory
+        const { sizeA, sizeB } = computeDynamicSizesFromInventory(
+            invA, invB, params.aIsAda,
+            { capA: params.capA, capB: params.capB },
+            { maxPctA: params.maxPctA, maxPctB: params.maxPctB, minTrA: params.minTrA, minTrB: params.minTrB }
+        );
+
+        if (action === "SELL_A") {
+            if (sizeA <= 0 || invA <= 0) {
+                const marked = invA + (invB / mid);
+                peakMarked = Math.max(peakMarked, marked);
+                maxDD = Math.max(maxDD, peakMarked - marked);
+                continue;
+            }
+            const rawOutB = mid * sizeA;
+            if (MIN_NOTIONAL_OUT > 0 && rawOutB < MIN_NOTIONAL_OUT) {
+                const marked = invA + (invB / mid);
+                peakMarked = Math.max(peakMarked, marked);
+                maxDD = Math.max(maxDD, peakMarked - marked);
+                continue;
+            }
+            const outB = applyFeesOut(rawOutB, TOTAL_FEE_BPS);
+            const pnlAda = (outB / mid) - sizeA;
+
+            invA -= sizeA;
             invB += outB;
             lastTradeAt = t;
 
-            tradePnLs.push(pnlAda);
-            rolling.push(invA + invB / mid);
-        } else if (action === "SELL_B") {
-            if (invB < combo.amountB) {
-                rolling.push(invA + invB / mid);
-                continue;
-            }
-            const rawOutA = combo.amountB / mid;
-            if (combo.minNotionalOut > 0 && rawOutA < combo.minNotionalOut) {
-                rolling.push(invA + invB / mid);
-                continue;
-            }
-            const outA = applyFeesOut(rawOutA, feeBps);
-            const pnlAda = outA - (combo.amountB / mid);
+            trades++; sellA++;
+            if (pnlAda > 0) wins++; else if (pnlAda < 0) losses++;
 
-            invB -= combo.amountB;
+        } else {
+            // SELL_B
+            if (sizeB <= 0 || invB <= 0) {
+                const marked = invA + (invB / mid);
+                peakMarked = Math.max(peakMarked, marked);
+                maxDD = Math.max(maxDD, peakMarked - marked);
+                continue;
+            }
+            const rawOutA = sizeB / mid;
+            if (MIN_NOTIONAL_OUT > 0 && rawOutA < MIN_NOTIONAL_OUT) {
+                const marked = invA + (invB / mid);
+                peakMarked = Math.max(peakMarked, marked);
+                maxDD = Math.max(maxDD, peakMarked - marked);
+                continue;
+            }
+            const outA = applyFeesOut(rawOutA, TOTAL_FEE_BPS);
+            const pnlAda = outA - (sizeB / mid);
+
+            invB -= sizeB;
             invA += outA;
             lastTradeAt = t;
 
-            tradePnLs.push(pnlAda);
-            rolling.push(invA + invB / mid);
-        } else {
-            rolling.push(invA + invB / mid);
+            trades++; sellB++;
+            if (pnlAda > 0) wins++; else if (pnlAda < 0) losses++;
         }
+
+        const marked = invA + (invB / mid);
+        peakMarked = Math.max(peakMarked, marked);
+        maxDD = Math.max(maxDD, peakMarked - marked);
     }
 
     const lastMid = series[series.length - 1].mid;
-    const endMarkedAda = invA + invB / lastMid;
-
-    const startMarkedAda = START_A + (START_B / series[0].mid);
-    const pnlAbs = endMarkedAda - startMarkedAda;
-    const pnlPct = startMarkedAda > 0 ? (pnlAbs / startMarkedAda) * 100 : 0;
-
-    const maxDDPct = computeMaxDrawdownPct(rolling);
-    const sharpeLike = computeSharpeLike(rolling); // per-step
-
-    const wins = tradePnLs.filter((x) => x > 0).length;
-    const winratePct = tradePnLs.length ? (wins / tradePnLs.length) * 100 : 0;
+    const endMarked = invA + (invB / lastMid);
+    const startMarked = START_A + (START_B / series[0].mid);
+    const pnlAda = endMarked - startMarked;
+    const winrate = trades > 0 ? wins / trades : 0;
+    const avgPnL = trades > 0 ? pnlAda / trades : 0;
 
     return {
-        trades: tradePnLs.length,
-        endMarkedAda,
-        pnlAbs,
-        pnlPct,
-        maxDDPct,
-        sharpeLike,
-        winratePct,
-        avgTradePnlAda: tradePnLs.length ? mean(tradePnLs) : 0,
-        medianTradePnlAda: tradePnLs.length ? median(tradePnLs) : 0,
+        endA: invA, endB: invB, endMarked, pnlAda, maxDD,
+        trades, sellA, sellB, wins, losses, winrate, avgPnL
     };
 }
 
-function computeMaxDrawdownPct(equity: number[]): number {
-    if (!equity.length) return 0;
-    let peak = equity[0];
-    let maxDD = 0;
-    for (const v of equity) {
-        if (v > peak) peak = v;
-        const dd = (peak - v) / peak;
-        if (dd > maxDD) maxDD = dd;
-    }
-    return maxDD * 100;
-}
-
-function computeSharpeLike(equity: number[]): number {
-    if (equity.length < 3) return 0;
-    // per-step returns
-    const rets: number[] = [];
-    for (let i = 1; i < equity.length; i++) {
-        const prev = equity[i - 1];
-        const curr = equity[i];
-        if (prev > 0) rets.push((curr - prev) / prev);
-    }
-    if (rets.length < 2) return 0;
-    const m = mean(rets);
-    const s = stddev(rets);
-    return s > 0 ? m / s : 0;
-}
-
-/* ----------------- main ----------------- */
+/* ---------- main sweep ---------- */
 async function main() {
-    // Resolve units like bot
+    // Resolve units
     const unitA = TOKEN_A_Q.toUpperCase() === "ADA" ? "lovelace" : await resolveTokenId(TOKEN_A_Q);
     const unitB = await resolveTokenId(TOKEN_B_Q);
     const vsUnit = unitA === "lovelace" ? "lovelace" : unitA;
@@ -351,30 +321,51 @@ async function main() {
         start: START_EPOCH || undefined,
         end: END_EPOCH || undefined,
     });
-    const series = candles
-        .map((c) => ({ t: c.ts, mid: Number(c.close) }))
-        .filter((p) => Number.isFinite(p.mid))
-        .sort((a, b) => a.t - b.t);
+    if (!candles.length) throw new Error("No candles returned.");
+
+    // Build mid series
+    const baseSeries = candles
+        .map(c => ({ t: c.ts, mid: Number(c.close) }))
+        .filter(p => Number.isFinite(p.mid))
+        .sort((a,b) => a.t - b.t);
 
     if (!PRICE_IS_B_PER_A) {
-        for (const p of series) p.mid = 1 / p.mid; // ensure B per A
+        for (const p of baseSeries) p.mid = 1 / p.mid;
     }
 
-    console.log(
-        `Sweep on A=${TOKEN_A_Q} (${unitA})  B=${TOKEN_B_Q} -> ${unitB}\n` +
-        `Points=${series.length} | interval=${INTERVAL} | fees=${POOL_FEE_BPS + EXTRA_AGG_FEE_BPS}bps`
-    );
+    const points = baseSeries.length;
+    console.log(`Candles: ${points} | interval=${INTERVAL} | pair A=${TOKEN_A_Q}(${unitA}) / B=${TOKEN_B_Q}(${unitB})`);
 
-    // Generate combos
-    const combos: Combo[] = [];
+    const tsRun = new Date().toISOString();
+
+    // Grid
     for (const bandBps of BAND_BPS_LIST) {
-        for (const alpha of ALPHA_LIST) {
-            for (const edgeBps of EDGE_LIST) {
-                for (const amountA of AMT_A_LIST) {
-                    for (const amountB of AMT_B_LIST) {
-                        for (const minNotionalOut of MIN_NOTIONAL_LIST) {
-                            for (const cooldownMs of COOL_MS_LIST) {
-                                combos.push({ bandBps, alpha, edgeBps, amountA, amountB, minNotionalOut, cooldownMs });
+        for (const edgeBps of EDGE_BPS_LIST) {
+            for (const alpha of ALPHA_LIST) {
+                for (const maxPctA of MAX_PCT_A_LIST) {
+                    for (const maxPctB of MAX_PCT_B_LIST) {
+                        for (const minTrA of MIN_TR_A_LIST) {
+                            for (const minTrB of MIN_TR_B_LIST) {
+                                for (const cooldownMs of COOLDOWN_LIST) {
+
+                                    const res = runBacktest(baseSeries, {
+                                        bandBps, alpha, edgeBps, cooldownMs,
+                                        capA: CAP_A, capB: CAP_B,
+                                        maxPctA, maxPctB, minTrA, minTrB,
+                                        aIsAda: TOKEN_A_Q.toUpperCase() === "ADA",
+                                    });
+
+                                    appendCsv(OUT, [
+                                        tsRun, INTERVAL, points,
+                                        TOKEN_A_Q, TOKEN_B_Q,
+                                        bandBps, edgeBps, alpha,
+                                        maxPctA, maxPctB, minTrA, minTrB,
+                                        CAP_A, CAP_B, RESERVE_ADA_DEC, POOL_FEE_BPS, EXTRA_AGG_FEE_BPS, cooldownMs,
+                                        START_A, START_B,
+                                        fix(res.endA, 6), fix(res.endB, 6), fix(res.endMarked, 6), fix(res.pnlAda, 6), fix(res.maxDD, 6),
+                                        res.trades, res.sellA, res.sellB, res.wins, res.losses, fix(res.winrate, 4), fix(res.avgPnL, 6),
+                                    ]);
+                                }
                             }
                         }
                     }
@@ -383,37 +374,7 @@ async function main() {
         }
     }
 
-    console.log(`Combos: ${combos.length}`);
-
-    for (const c of combos) {
-        const res = runCombo(series, c);
-        appendCsv(OUT, [
-            c.bandBps,
-            fix(c.alpha, 4),
-            c.edgeBps,
-            fix(c.amountA, 6),
-            fix(c.amountB, 6),
-            fix(c.minNotionalOut, 6),
-            c.cooldownMs,
-            res.trades,
-            fix(res.endMarkedAda, 6),
-            fix(res.pnlAbs, 6),
-            fix(res.pnlPct, 3),
-            fix(res.maxDDPct, 3),
-            fix(res.sharpeLike, 4),
-            fix(res.winratePct, 2),
-            fix(res.avgTradePnlAda, 6),
-            fix(res.medianTradePnlAda, 6),
-        ]);
-    }
-
-    console.log(`Wrote: ${OUT}`);
-}
-
-function fix(x: any, d: number) {
-    const n = Number(x);
-    if (!Number.isFinite(n)) return String(x);
-    return n.toFixed(d);
+    console.log(`Sweep complete → ${OUT}`);
 }
 
 main().catch((err) => {

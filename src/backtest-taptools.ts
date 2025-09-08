@@ -9,7 +9,7 @@ import axios from "axios";
  * - mid = TOKEN_B per TOKEN_A (same as live bot)
  * - EMA(BAND_ALPHA), BAND_BPS, EDGE_BPS, MIN_NOTIONAL_OUT guard, ONLY_VERIFIED
  * - Optional cooldown in backtest via BT_COOLDOWN_MS (default 0)
- * - Trades sized by AMOUNT_A_DEC / AMOUNT_B_DEC in human units
+ * - **Dynamic sizing**: % of balance with floors, ADA reserve, and fixed caps
  * - Fees modeled via BT_POOL_FEE_BPS + BT_AGG_FEE_BPS (defaults 30 + 0)
  */
 
@@ -23,12 +23,20 @@ const EDGE_BPS   = num(process.env.EDGE_BPS, 5);
 const MIN_NOTIONAL_OUT = num(process.env.MIN_NOTIONAL_OUT, 0); // guard on min_out (human)
 const ONLY_VERIFIED = (process.env.ONLY_VERIFIED ?? "true").toLowerCase() === "true";
 
-// Sizing (human units)
-const AMOUNT_A_DEC = num(process.env.AMOUNT_A_DEC, 10);
-const AMOUNT_B_DEC = num(process.env.AMOUNT_B_DEC, 100);
+// Sizing caps (human units; act as ceilings)
+const AMOUNT_A_DEC_CAP = num(process.env.AMOUNT_A_DEC, 10);
+const AMOUNT_B_DEC_CAP = num(process.env.AMOUNT_B_DEC, 100);
+
+// Dynamic sizing controls (mirror bot defaults)
+const MAX_PCT_A = num(process.env.MAX_PCT_A, 15);     // % of A balance per SELL_A
+const MAX_PCT_B = num(process.env.MAX_PCT_B, 15);     // % of B balance per SELL_B
+const MIN_TRADE_A_DEC = num(process.env.MIN_TRADE_A_DEC, 5);
+const MIN_TRADE_B_DEC = num(process.env.MIN_TRADE_B_DEC, 50);
+const RESERVE_ADA_DEC = num(process.env.RESERVE_ADA_DEC, 0);
+const FEE_BUF_ADA     = 2; // small fee headroom, like live bot
 
 // Pair
-const TOKEN_A_Q = (process.env.TOKEN_A ?? "ADA").trim(); // "ADA" or unit
+const TOKEN_A_Q = (process.env.TOKEN_A ?? "ADA").trim();  // "ADA" or unit/ticker
 const TOKEN_B_Q = (process.env.TOKEN_B ?? "USDM").trim(); // ticker or unit
 
 // TapTools request
@@ -75,6 +83,9 @@ function applyFeesOut(amountOut: number, totalFeeBps: number) {
 }
 function ensureCsvHeader(file: string, header: string) {
     if (!fs.existsSync(file)) fs.writeFileSync(file, header, "utf8");
+}
+function clamp(n: number, lo: number, hi: number) {
+    return Math.max(lo, Math.min(hi, n));
 }
 
 /** Resolve a token to on-chain unit using Minswap Aggregator (like the live bot). */
@@ -145,8 +156,47 @@ function normalizeTs(x: number) {
     return String(x).length < 13 ? x * 1000 : x;
 }
 
+/* ---------- dynamic sizing (backtest) ---------- */
+/**
+ * Compute dynamic trade sizes for the backtest using inventory balances.
+ * Mirrors live bot logic:
+ *  - % of balance with floors & fixed caps
+ *  - ADA reserve (for A if ADA)
+ *  - Never exceed available inventory
+ */
+function computeDynamicSizesFromInventory(
+    invA: number, invB: number, mid: number,
+    caps: { capA: number; capB: number },
+    aIsAda: boolean
+): { sizeA: number; sizeB: number } {
+
+    // Max amount of A we allow to spend this tick
+    let maxSpendA = invA;
+    if (aIsAda) {
+        maxSpendA = Math.max(0, invA - RESERVE_ADA_DEC - FEE_BUF_ADA);
+    }
+
+    const dynA = (MAX_PCT_A / 100) * maxSpendA;
+    const dynB = (MAX_PCT_B / 100) * invB;
+
+    // Apply floors/ceilings, then bound by available inventory
+    const sizeA = Math.min(
+        invA, // can't sell more than we own
+        clamp(dynA, MIN_TRADE_A_DEC, caps.capA)
+    );
+
+    const sizeB = Math.min(
+        invB,
+        clamp(dynB, MIN_TRADE_B_DEC, caps.capB)
+    );
+
+    return { sizeA, sizeB };
+}
+
 /* ---------- backtest ---------- */
 async function main() {
+    if (!TAP_KEY) throw new Error("Missing TAPTOOLS_API_KEY");
+
     // Resolve units to align with bot
     const unitA = TOKEN_A_Q.toUpperCase() === "ADA" ? "lovelace" : await resolveTokenId(TOKEN_A_Q);
     const unitB = await resolveTokenId(TOKEN_B_Q);
@@ -180,19 +230,20 @@ async function main() {
     console.log(
         `Backtest pair: A=${TOKEN_A_Q} (${unitA})  B=${TOKEN_B_Q} -> ${unitB}\n` +
         `Points=${series.length}  | interval=${INTERVAL} | BAND_BPS=${BAND_BPS} ALPHA=${BAND_ALPHA} EDGE_BPS=${EDGE_BPS}\n` +
-        `Sizes: A=${AMOUNT_A_DEC}  B=${AMOUNT_B_DEC}  | Fees: pool=${POOL_FEE_BPS}bps agg=${EXTRA_AGG_FEE_BPS}bps\n`
+        `Caps: A<=${AMOUNT_A_DEC_CAP}  B<=${AMOUNT_B_DEC_CAP}  | Fees: pool=${POOL_FEE_BPS}bps agg=${EXTRA_AGG_FEE_BPS}bps\n` +
+        `Sizing: MAX_PCT_A=${MAX_PCT_A}% MAX_PCT_B=${MAX_PCT_B}% | Floors: A=${MIN_TRADE_A_DEC} B=${MIN_TRADE_B_DEC} | ADA reserve=${RESERVE_ADA_DEC}`
     );
 
-    // Sim state
-    let invA = num(process.env.BT_START_ADA, 100);      // start A (ADA) human units
-    let invB = num(process.env.BT_START_TOKB, 0);       // start B human units
+    // Sim state (start balances)
+    let invA = num(process.env.BT_START_ADA, 100); // start A (ADA) human units if A=ADA; otherwise "A" units
+    let invB = num(process.env.BT_START_TOKB, 0);  // start B human units
     const totalFeeBps = POOL_FEE_BPS + EXTRA_AGG_FEE_BPS;
 
     // EMA center & cooldown
     let center = series[0].mid;
     let lastTradeAt = 0;
 
-    let rollingMarkedAda = invA + (invB / series[0].mid);
+    let rollingMarkedAda = invA + (invB / series[0].mid); // value in A-terms (when A=ADA this is ADA)
 
     for (const { t, mid } of series) {
         // EMA update
@@ -212,26 +263,39 @@ async function main() {
             if (remain > 0) action = "HOLD";
         }
 
+        // If no trade, just mark portfolio
         if (action === "HOLD") {
             rollingMarkedAda = invA + (invB / mid);
             continue;
         }
 
+        // --- Dynamic sizing from balances (mirrors bot) ---
+        const { sizeA, sizeB } = computeDynamicSizesFromInventory(
+            invA,
+            invB,
+            mid,
+            { capA: AMOUNT_A_DEC_CAP, capB: AMOUNT_B_DEC_CAP },
+            /* aIsAda */ TOKEN_A_Q.toUpperCase() === "ADA"
+        );
+
         if (action === "SELL_A") {
-            if (invA < AMOUNT_A_DEC) { rollingMarkedAda = invA + (invB / mid); continue; }
-            // min_out (B) for selling A at mid: raw = mid * size; guard by MIN_NOTIONAL_OUT
-            const rawOutB = mid * AMOUNT_A_DEC;
+            if (sizeA <= 0 || invA <= 0) { rollingMarkedAda = invA + (invB / mid); continue; }
+
+            // raw out in B (before fees) selling sizeA of A at mid
+            const rawOutB = mid * sizeA;
+
+            // min_notional guard
             if (MIN_NOTIONAL_OUT > 0 && rawOutB < MIN_NOTIONAL_OUT) {
                 rollingMarkedAda = invA + (invB / mid);
                 continue;
             }
+
             const outB = applyFeesOut(rawOutB, totalFeeBps);
 
-            // PnL in ADA at decision mid:
-            // value of B received in ADA minus ADA spent
-            const pnlAda = (outB / mid) - AMOUNT_A_DEC;
+            // PnL in A-terms at mid: (B received in A) - A sold
+            const pnlAda = (outB / mid) - sizeA;
 
-            invA -= AMOUNT_A_DEC;
+            invA -= sizeA;
             invB += outB;
             lastTradeAt = t;
 
@@ -244,7 +308,7 @@ async function main() {
                 center,
                 lower,
                 upper,
-                AMOUNT_A_DEC,
+                sizeA,
                 TOKEN_A_Q,
                 outB,
                 TOKEN_B_Q,
@@ -253,20 +317,23 @@ async function main() {
                 rollingMarkedAda
             ]);
         } else {
-            if (invB < AMOUNT_B_DEC) { rollingMarkedAda = invA + (invB / mid); continue; }
-            // min_out (A) for selling B at mid: raw = B / mid
-            const rawOutA = AMOUNT_B_DEC / mid;
+            // SELL_B
+            if (sizeB <= 0 || invB <= 0) { rollingMarkedAda = invA + (invB / mid); continue; }
+
+            // raw out in A selling sizeB of B at mid
+            const rawOutA = sizeB / mid;
+
             if (MIN_NOTIONAL_OUT > 0 && rawOutA < MIN_NOTIONAL_OUT) {
                 rollingMarkedAda = invA + (invB / mid);
                 continue;
             }
+
             const outA = applyFeesOut(rawOutA, totalFeeBps);
 
-            // PnL in ADA:
-            // ADA received minus ADA value of B sold at mid
-            const pnlAda = outA - (AMOUNT_B_DEC / mid);
+            // PnL in A-terms: A received - A value of B sold at mid
+            const pnlAda = outA - (sizeB / mid);
 
-            invB -= AMOUNT_B_DEC;
+            invB -= sizeB;
             invA += outA;
             lastTradeAt = t;
 
@@ -279,7 +346,7 @@ async function main() {
                 center,
                 lower,
                 upper,
-                AMOUNT_B_DEC,
+                sizeB,
                 TOKEN_B_Q,
                 outA,
                 TOKEN_A_Q,

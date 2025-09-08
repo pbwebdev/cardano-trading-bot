@@ -16,8 +16,8 @@ const AGG = "https://agg-api.minswap.org/aggregator";
 // Pair & sizing
 const TOKEN_A_Q = (process.env.TOKEN_A ?? "ADA").trim();
 const TOKEN_B_Q = (process.env.TOKEN_B ?? "MIN").trim();
-const AMOUNT_A_DEC = (process.env.AMOUNT_A_DEC ?? "10").trim();   // sell A (human units)
-const AMOUNT_B_DEC = (process.env.AMOUNT_B_DEC ?? "100").trim();  // sell B (human units)
+const AMOUNT_A_DEC = (process.env.AMOUNT_A_DEC ?? "10").trim();   // cap for A sell (human units)
+const AMOUNT_B_DEC = (process.env.AMOUNT_B_DEC ?? "100").trim();  // cap for B sell (human units)
 
 // Numeric env helper
 function num(env: string | undefined, fallback: number) {
@@ -40,6 +40,12 @@ const POLL_MS     = num(process.env.POLL_MS, 60000);
 // Guards
 const MIN_NOTIONAL_OUT = num(process.env.MIN_NOTIONAL_OUT, 0); // skip if out < this (human units)
 const RESERVE_ADA_DEC  = num(process.env.RESERVE_ADA_DEC, 0);  // keep at least this many ADA
+
+// Dynamic sizing controls (defaults chosen conservatively)
+const MAX_PCT_A = num(process.env.MAX_PCT_A, 15);       // % of A balance per SELL_A
+const MAX_PCT_B = num(process.env.MAX_PCT_B, 15);       // % of B balance per SELL_B
+const MIN_TRADE_A_DEC = num(process.env.MIN_TRADE_A_DEC, 5);
+const MIN_TRADE_B_DEC = num(process.env.MIN_TRADE_B_DEC, 50);
 
 // Runtime
 const DRY_RUN   = (process.env.DRY_RUN ?? "true").toLowerCase() === "true";
@@ -70,7 +76,7 @@ if (!fs.existsSync(LOG)) {
 function blockfrostBase(net: Net) {
     return net === "Mainnet" ? "https://cardano-mainnet.blockfrost.io/api/v0"
         : net === "Preprod"   ? "https://cardano-preprod.blockfrost.io/api/v0"
-            :                           "https://cardano-preview.blockfrost.io/api/v0";
+            :                       "https://cardano-preview.blockfrost.io/api/v0";
 }
 
 async function makeLucid() {
@@ -95,6 +101,22 @@ async function resolveTokenId(query: string): Promise<string> {
     const chosen = exact ?? items[0];
     console.log(`Resolved ${query} => ${chosen.token_id || "lovelace"} (${chosen.ticker ?? ""})`);
     return chosen.token_id;
+}
+
+// --- decimals/meta (needed for human-sizing of token balances) ---
+function isUnitLike(s: string) { return /^[0-9a-f]{56}\.[0-9a-f]+$/i.test(s); }
+async function resolveTokenMeta(query: string): Promise<{ unit: string; decimals: number; ticker?: string }> {
+    if (query.toUpperCase() === "ADA") return { unit: "lovelace", decimals: 6, ticker: "ADA" };
+    if (isUnitLike(query)) return { unit: query, decimals: 0 };
+    try {
+        const resp = await axios.post(`${AGG}/tokens`, { query, only_verified: ONLY_VERI });
+        const items: any[] = resp.data?.tokens ?? [];
+        const chosen = items.find(t => (t.ticker || "").toLowerCase() === query.toLowerCase()) ?? items[0];
+        if (!chosen) throw new Error("Token not found: " + query);
+        return { unit: chosen.token_id, decimals: Number(chosen.decimals ?? 0), ticker: chosen.ticker };
+    } catch {
+        return { unit: query, decimals: 0 };
+    }
 }
 
 function makeWitness(txCborHex: string, bech32Sk: string): string {
@@ -247,16 +269,92 @@ function bounds(center: number, bps: number) {
 }
 function bpsOver(x: number, y: number) { return ((x - y) / y) * 10000; }
 
+// -------- dynamic sizing helpers --------
+function clamp(n: number, lo: number, hi: number) {
+    return Math.max(lo, Math.min(hi, n));
+}
+function fmt(n: number, dp = 6) {
+    return Number.isFinite(n) ? n.toFixed(dp) : "0";
+}
+function splitUnit(unit: string): { policy: string; nameHex: string } {
+    const [policy, nameHex] = unit.split(".");
+    return { policy, nameHex };
+}
+async function getUtxos(lucid: Lucid) {
+    return await lucid.wallet.getUtxos();
+}
+function sumAsset(utxos: any[], unit: string): bigint {
+    if (unit === "lovelace") {
+        return utxos.reduce((acc, u) => acc + BigInt(u.assets["lovelace"] ?? 0n), 0n);
+    }
+    const { policy, nameHex } = splitUnit(unit);
+    const key = `${policy}${nameHex ? nameHex : ""}`;
+    return utxos.reduce((acc, u) => acc + BigInt(u.assets[key] ?? 0n), 0n);
+}
+function toHumanBase(amountBase: bigint, decimals: number): number {
+    if (amountBase <= 0n) return 0;
+    const scale = 10 ** Math.max(0, decimals);
+    return Number(amountBase) / scale;
+}
+async function getBalanceHuman(lucid: Lucid, unit: string, decimals: number): Promise<number> {
+    const utxos = await getUtxos(lucid);
+    if (unit === "lovelace") {
+        const lovelace = sumAsset(utxos, "lovelace");
+        return Number(lovelace) / 1_000_000;
+    }
+    const base = sumAsset(utxos, unit);
+    return toHumanBase(base, decimals);
+}
+
+/**
+ * Compute dynamic trade sizes (human decimals) for both legs.
+ * - Uses % of current balances with floors/ceilings
+ * - Reserves ADA so you never strand fees/staking
+ * - Returns strings ready for aggregator when amount_in_decimal=true
+ */
+async function computeDynamicTradeSizes(
+    lucid: Lucid,
+    unitA: string, decA: number,
+    unitB: string, decB: number,
+    caps: { AMOUNT_A_DEC: number; AMOUNT_B_DEC: number }
+): Promise<{ tradeA_str: string; tradeB_str: string; tradeA_num: number; tradeB_num: number }> {
+
+    const feeBufAda = 2; // small headroom for tx fees
+
+    const balA = await getBalanceHuman(lucid, unitA, decA);
+    const balB = await getBalanceHuman(lucid, unitB, decB);
+
+    let maxSpendA = (unitA === "lovelace")
+        ? Math.max(0, balA - RESERVE_ADA_DEC - feeBufAda)
+        : balA;
+
+    const dynA = (MAX_PCT_A / 100) * maxSpendA;
+    const dynB = (MAX_PCT_B / 100) * balB;
+
+    const tradeA_num = clamp(dynA, MIN_TRADE_A_DEC, caps.AMOUNT_A_DEC);
+    const tradeB_num = clamp(dynB, MIN_TRADE_B_DEC, caps.AMOUNT_B_DEC);
+
+    const tradeA_str = fmt(tradeA_num, Math.min(6, decA || 6));
+    const tradeB_str = fmt(tradeB_num, Math.min(6, decB || 6));
+
+    return { tradeA_str, tradeB_str, tradeA_num, tradeB_num };
+}
+
 let centerGlobal: number | null = null;  // for SIGINT persistence
 
 async function main() {
     const lucid = await makeLucid();
     const sender = await lucid.wallet.address();
 
+    // Resolve token units & decimals
     const unitA = await resolveTokenId(TOKEN_A_Q);
     const unitB = await resolveTokenId(TOKEN_B_Q);
+    const metaA = await resolveTokenMeta(TOKEN_A_Q);
+    const metaB = await resolveTokenMeta(TOKEN_B_Q);
+    const decA = metaA.decimals ?? (unitA === "lovelace" ? 6 : 0);
+    const decB = metaB.decimals ?? (unitB === "lovelace" ? 6 : 0);
 
-    console.log(`PAIR: ${TOKEN_A_Q} (${unitA}) ⇄ ${TOKEN_B_Q} (${unitB})`);
+    console.log(`PAIR: ${TOKEN_A_Q} (${unitA}, d=${decA}) ⇄ ${TOKEN_B_Q} (${unitB}, d=${decB})`);
     console.log(`Poll=${POLL_MS}ms | slippage=${SLIPPAGE_PCT}% | feeCap=${FEE_CAP_PCT}% | dryRun=${DRY_RUN} | EMA alpha=${BAND_ALPHA} | band±${BAND_BPS}bps | edge=${EDGE_BPS}bps`);
 
     // fees buffer
@@ -275,19 +373,19 @@ async function main() {
     // eslint-disable-next-line no-constant-condition
     while (true) {
         try {
-            const amtA = Number(AMOUNT_A_DEC);
-            const amtB = Number(AMOUNT_B_DEC);
+            const capA = Number(AMOUNT_A_DEC);
+            const capB = Number(AMOUNT_B_DEC);
 
-            // 1) Quotes both ways (human-sized)
-            const [{ req: reqAB, res: resAB }, { req: reqBA, res: resBA }] = await Promise.all([
+            // 1) Quotes both ways (using caps) to compute mid & guards
+            const [{ res: resAB_caps }, { res: resBA_caps }] = await Promise.all([
                 estimate(unitA, unitB, AMOUNT_A_DEC),
                 estimate(unitB, unitA, AMOUNT_B_DEC),
             ]);
 
-            const minOutAB = Number(resAB.min_amount_out);
-            const minOutBA = Number(resBA.min_amount_out);
+            const minOutAB = Number(resAB_caps.min_amount_out);
+            const minOutBA = Number(resBA_caps.min_amount_out);
             if (!Number.isFinite(minOutAB) || !Number.isFinite(minOutBA)) {
-                throw new Error(`Bad min_amount_out: A->B=${resAB.min_amount_out} B->A=${resBA.min_amount_out}`);
+                throw new Error(`Bad min_amount_out: A->B=${resAB_caps.min_amount_out} B->A=${resBA_caps.min_amount_out}`);
             }
 
             // Optional notional guard (in token_out human units)
@@ -296,8 +394,8 @@ async function main() {
             if (smallAB) console.log(`[guard] A->B min_out ${minOutAB} < ${MIN_NOTIONAL_OUT} — holding`);
             if (smallBA) console.log(`[guard] B->A min_out ${minOutBA} < ${MIN_NOTIONAL_OUT} — holding`);
 
-            // 2) Mid price (TOKEN_B per TOKEN_A)
-            const mid = deriveMid(minOutAB, minOutBA, amtA, amtB);
+            // 2) Mid price (TOKEN_B per TOKEN_A) using caps for stability
+            const mid = deriveMid(minOutAB, minOutBA, capA, capB);
 
             // 3) EMA center update
             if (!Number.isFinite(center)) {
@@ -337,23 +435,31 @@ async function main() {
                 }
             }
 
-            // 6) Balance checks + reserve ADA guard (SELL_A only)
+            // 6) Compute dynamic sizes off live balances (floors/ceilings/reserve)
+            const { tradeA_str, tradeB_str, tradeA_num, tradeB_num } =
+                await computeDynamicTradeSizes(lucid, unitA, decA, unitB, decB, { AMOUNT_A_DEC: capA, AMOUNT_B_DEC: capB });
+
+            if (tradeA_num <= 0 && tradeB_num <= 0) {
+                console.log("[sizing] no available size (after reserve/floors) — holding");
+                await new Promise((r) => setTimeout(r, POLL_MS));
+                continue;
+            }
+
+            // 7) Re-estimate for the chosen side using the dynamic size, then execute
             if (action === "SELL_A") {
+                // ADA reserve guard if A is ADA (uses dynamic size)
                 if (unitA === "lovelace") {
                     const buf = 2_000_000n; // fee buffer
                     const adaBal = await getAdaBalance(lucid);
-                    const sellAdaLovelace = BigInt(Math.round(amtA * 1_000_000));
+                    const sellAdaLovelace = BigInt(Math.round(tradeA_num * 1_000_000));
                     const reserveLovelace  = BigInt(Math.round(RESERVE_ADA_DEC * 1_000_000));
 
-                    // keep ≥ reserve + fees AFTER selling
                     if (adaBal - sellAdaLovelace < reserveLovelace + buf) {
                         console.log(`[guard] reserve: keep ≥ ${RESERVE_ADA_DEC} ADA + fees; holding`);
                         await new Promise((r) => setTimeout(r, POLL_MS));
                         continue;
                     }
-
-                    const required = sellAdaLovelace + buf;
-                    if (adaBal < required) {
+                    if (adaBal < sellAdaLovelace + buf) {
                         console.warn("Not enough ADA to sell A");
                         await new Promise((r) => setTimeout(r, POLL_MS));
                         continue;
@@ -366,10 +472,31 @@ async function main() {
                         continue;
                     }
                 }
+
+                // Re-estimate with dynamic amount
+                const { req: reqAB, res: resAB } = await estimate(unitA, unitB, tradeA_str);
+                console.log(`ACTION: SELL_A ${tradeA_str} ${TOKEN_A_Q} → ${TOKEN_B_Q} (edge+${overUpperBps.toFixed(2)}bps)`);
+
+                if (DRY_RUN) {
+                    console.log("[dry-run] skipping trade");
+                } else {
+                    const tx = await executeSwap(sender, reqAB, resAB);
+                    console.log("Submitted:", tx);
+
+                    // PnL in ADA at decision mid:
+                    // Received B (human) -> ADA value ≈ B / mid; minus ADA spent
+                    const minOutB_human = humanMinOut(resAB);
+                    const pnlADA = (minOutB_human / mid) - tradeA_num;
+
+                    console.log(`PnL (SELL_A): ${pnlADA.toFixed(6)} ADA @ mid ${mid.toFixed(8)}`);
+                    logFill("SELL_A", tradeA_str, TOKEN_A_Q, String(minOutB_human), TOKEN_B_Q, tx, mid, pnlADA);
+
+                    lastTradeAt = Date.now();
+                }
             } else if (action === "SELL_B") {
                 if (unitB === "lovelace") {
                     const buf = 2_000_000n;
-                    const required = BigInt(Math.round(amtB * 1_000_000)) + buf;
+                    const required = BigInt(Math.round(tradeB_num * 1_000_000)) + buf;
                     const adaBal = await getAdaBalance(lucid);
                     if (adaBal < required) {
                         console.warn("Not enough ADA to sell B");
@@ -384,30 +511,11 @@ async function main() {
                         continue;
                     }
                 }
-            }
 
-            // 7) Execute + PnL log
-            if (action === "SELL_A") {
-                console.log(`ACTION: SELL_A ${AMOUNT_A_DEC} ${TOKEN_A_Q} → ${TOKEN_B_Q} (edge+${overUpperBps.toFixed(2)}bps)`);
-                if (DRY_RUN) {
-                    console.log("[dry-run] skipping trade");
-                } else {
-                    const tx = await executeSwap(sender, reqAB, resAB);
-                    console.log("Submitted:", tx);
+                // Re-estimate with dynamic amount
+                const { req: reqBA, res: resBA } = await estimate(unitB, unitA, tradeB_str);
+                console.log(`ACTION: SELL_B ${tradeB_str} ${TOKEN_B_Q} → ${TOKEN_A_Q} (edge+${underLowerBps.toFixed(2)}bps)`);
 
-                    // PnL in ADA at decision mid:
-                    // Received B (human) -> ADA value ≈ B / mid; minus ADA spent
-                    const amtA_num = Number(AMOUNT_A_DEC);
-                    const minOutB_human = humanMinOut(resAB);
-                    const pnlADA = (minOutB_human / mid) - amtA_num;
-
-                    console.log(`PnL (SELL_A): ${pnlADA.toFixed(6)} ADA @ mid ${mid.toFixed(8)}`);
-                    logFill("SELL_A", AMOUNT_A_DEC, TOKEN_A_Q, String(minOutB_human), TOKEN_B_Q, tx, mid, pnlADA);
-
-                    lastTradeAt = Date.now();
-                }
-            } else if (action === "SELL_B") {
-                console.log(`ACTION: SELL_B ${AMOUNT_B_DEC} ${TOKEN_B_Q} → ${TOKEN_A_Q} (edge+${underLowerBps.toFixed(2)}bps)`);
                 if (DRY_RUN) {
                     console.log("[dry-run] skipping trade");
                 } else {
@@ -416,12 +524,11 @@ async function main() {
 
                     // PnL in ADA at decision mid:
                     // Received ADA (human) minus ADA-equivalent of B sold
-                    const amtB_num = Number(AMOUNT_B_DEC);
                     const minOutA_human = humanMinOut(resBA);
-                    const pnlADA = minOutA_human - (amtB_num / mid);
+                    const pnlADA = minOutA_human - (tradeB_num / mid);
 
                     console.log(`PnL (SELL_B): ${pnlADA.toFixed(6)} ADA @ mid ${mid.toFixed(8)}`);
-                    logFill("SELL_B", AMOUNT_B_DEC, TOKEN_B_Q, String(minOutA_human), TOKEN_A_Q, tx, mid, pnlADA);
+                    logFill("SELL_B", tradeB_str, TOKEN_B_Q, String(minOutA_human), TOKEN_A_Q, tx, mid, pnlADA);
 
                     lastTradeAt = Date.now();
                 }
