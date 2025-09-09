@@ -6,11 +6,7 @@ import axios from "axios";
 
 /**
  * Backtests the EMA-band strategy to match src/bot-twoway.ts behavior.
- * - mid = TOKEN_B per TOKEN_A (same as live bot)
- * - EMA(BAND_ALPHA), BAND_BPS, EDGE_BPS, MIN_NOTIONAL_OUT guard, ONLY_VERIFIED
- * - Optional cooldown in backtest via BT_COOLDOWN_MS (default 0)
- * - **Dynamic sizing**: % of balance with floors, ADA reserve, and fixed caps
- * - Fees modeled via BT_POOL_FEE_BPS + BT_AGG_FEE_BPS (defaults 30 + 0)
+ * Adds decision cadence + cycle profit filter + trailing/hard stops.
  */
 
 type Net = "Mainnet" | "Preprod" | "Preview";
@@ -28,16 +24,16 @@ const AMOUNT_A_DEC_CAP = num(process.env.AMOUNT_A_DEC, 10);
 const AMOUNT_B_DEC_CAP = num(process.env.AMOUNT_B_DEC, 100);
 
 // Dynamic sizing controls (mirror bot defaults)
-const MAX_PCT_A = num(process.env.MAX_PCT_A, 15);     // % of A balance per SELL_A
-const MAX_PCT_B = num(process.env.MAX_PCT_B, 15);     // % of B balance per SELL_B
+const MAX_PCT_A = num(process.env.MAX_PCT_A, 15);
+const MAX_PCT_B = num(process.env.MAX_PCT_B, 15);
 const MIN_TRADE_A_DEC = num(process.env.MIN_TRADE_A_DEC, 5);
 const MIN_TRADE_B_DEC = num(process.env.MIN_TRADE_B_DEC, 50);
 const RESERVE_ADA_DEC = num(process.env.RESERVE_ADA_DEC, 0);
-const FEE_BUF_ADA     = 2; // small fee headroom, like live bot
+const FEE_BUF_ADA     = 2; // small fee headroom
 
 // Pair
-const TOKEN_A_Q = (process.env.TOKEN_A ?? "ADA").trim();  // "ADA" or unit/ticker
-const TOKEN_B_Q = (process.env.TOKEN_B ?? "USDM").trim(); // ticker or unit
+const TOKEN_A_Q = (process.env.TOKEN_A ?? "ADA").trim();
+const TOKEN_B_Q = (process.env.TOKEN_B ?? "USDM").trim();
 
 // TapTools request
 const TAP_BASE     = (process.env.TAPTOOLS_BASE ?? "https://openapi.taptools.io").trim();
@@ -49,11 +45,21 @@ const END_EPOCH    = num(process.env.BT_END_EPOCH, 0);   // ms epoch (optional)
 const PRICE_IS_B_PER_A = (process.env.BT_PRICE_IS_B_PER_A ?? "true").toLowerCase() === "true";
 
 // Fees (bps)
-const POOL_FEE_BPS      = num(process.env.BT_POOL_FEE_BPS, 30); // 0.30%
+const POOL_FEE_BPS      = num(process.env.BT_POOL_FEE_BPS, 30);
 const EXTRA_AGG_FEE_BPS = num(process.env.BT_AGG_FEE_BPS, 0);
 
 // Optional backtest cooldown (ms) – to reflect live behavior
 const BT_COOLDOWN_MS    = num(process.env.BT_COOLDOWN_MS, 0);
+
+// Decision cadence (0 disables; e.g., 14_400_000 = 4h)
+const BT_DECISION_EVERY_MS = num(process.env.BT_DECISION_EVERY_MS, 0);
+
+// Profit filter & stops (0 = disabled)
+const USE_CYCLE_FILTER   = (process.env.USE_CYCLE_FILTER ?? "true").toLowerCase() === "true";
+const MIN_CYCLE_PNL_BPS  = num(process.env.MIN_CYCLE_PNL_BPS, 0);
+const EST_CYCLE_FEES_BPS = num(process.env.EST_CYCLE_FEES_BPS, 60);
+const TRAIL_STOP_BPS     = num(process.env.TRAIL_STOP_BPS, 0);
+const HARD_STOP_BPS      = num(process.env.HARD_STOP_BPS, 0);
 
 // Output
 const OUT = path.join(process.cwd(), "backtest_trades.csv");
@@ -71,7 +77,6 @@ function num(x: any, def: number): number {
     return Number.isFinite(n) ? n : def;
 }
 function isUnit(u: string) {
-    // policyId(56 hex) + '.' + asset name hex
     return /^[0-9a-f]{56}\.[0-9a-f]+$/i.test(u);
 }
 function bpsOver(x: number, y: number) { return ((x - y) / y) * 10000; }
@@ -104,7 +109,7 @@ async function resolveTokenId(query: string): Promise<string> {
 
 type Candle = { ts: number; open: number; high: number; low: number; close: number; volume?: number };
 
-/** Fetch candles from TapTools. We request price quoted vs ADA (lovelace) when possible. */
+/** Fetch candles from TapTools. */
 async function fetchCandlesTapTools(params: {
     unitBase: string;  // TOKEN_B unit (asset whose price we want)
     vsUnit: string;    // quote denominator (ADA=lovelace) for B/A series
@@ -116,7 +121,7 @@ async function fetchCandlesTapTools(params: {
     const PATH = "/api/v1/token/ohlcv";
     const q: Record<string, any> = {
         unit: params.unitBase,
-        onchainID: params.unitBase, // some plans use this key
+        onchainID: params.unitBase,
         vs_unit: params.vsUnit,
         interval: params.interval,
         limit: params.limit,
@@ -151,26 +156,17 @@ async function fetchCandlesTapTools(params: {
     }
 }
 function normalizeTs(x: number) {
-    // seconds vs ms heuristic
     if (!Number.isFinite(x)) return Date.now();
     return String(x).length < 13 ? x * 1000 : x;
 }
 
 /* ---------- dynamic sizing (backtest) ---------- */
-/**
- * Compute dynamic trade sizes for the backtest using inventory balances.
- * Mirrors live bot logic:
- *  - % of balance with floors & fixed caps
- *  - ADA reserve (for A if ADA)
- *  - Never exceed available inventory
- */
 function computeDynamicSizesFromInventory(
     invA: number, invB: number, mid: number,
     caps: { capA: number; capB: number },
     aIsAda: boolean
 ): { sizeA: number; sizeB: number } {
 
-    // Max amount of A we allow to spend this tick
     let maxSpendA = invA;
     if (aIsAda) {
         maxSpendA = Math.max(0, invA - RESERVE_ADA_DEC - FEE_BUF_ADA);
@@ -179,9 +175,8 @@ function computeDynamicSizesFromInventory(
     const dynA = (MAX_PCT_A / 100) * maxSpendA;
     const dynB = (MAX_PCT_B / 100) * invB;
 
-    // Apply floors/ceilings, then bound by available inventory
     const sizeA = Math.min(
-        invA, // can't sell more than we own
+        invA,
         clamp(dynA, MIN_TRADE_A_DEC, caps.capA)
     );
 
@@ -193,7 +188,6 @@ function computeDynamicSizesFromInventory(
     return { sizeA, sizeB };
 }
 
-/* ---------- backtest ---------- */
 async function main() {
     if (!TAP_KEY) throw new Error("Missing TAPTOOLS_API_KEY");
 
@@ -201,13 +195,11 @@ async function main() {
     const unitA = TOKEN_A_Q.toUpperCase() === "ADA" ? "lovelace" : await resolveTokenId(TOKEN_A_Q);
     const unitB = await resolveTokenId(TOKEN_B_Q);
 
-    // We want mid = TOKEN_B per TOKEN_A. If A=ADA, fetch B/ADA candles (vs_unit = lovelace).
-    // If A != ADA, we still fetch B quoted in vsUnit = unitA when possible; else you can invert per flag.
     const vsUnit = unitA === "lovelace" ? "lovelace" : unitA;
 
     const candles = await fetchCandlesTapTools({
-        unitBase: unitB,          // price series for TOKEN_B
-        vsUnit,                   // quoted vs TOKEN_A (ideally ADA/lovelace)
+        unitBase: unitB,
+        vsUnit,
         interval: INTERVAL,
         limit: MAX_CANDLES,
         start: START_EPOCH || undefined,
@@ -222,7 +214,6 @@ async function main() {
         .filter(p => Number.isFinite(p.mid))
         .sort((a, b) => a.t - b.t);
 
-    // Ensure mid = B per A (same as live bot)
     if (!PRICE_IS_B_PER_A) {
         for (const p of series) p.mid = 1 / p.mid;
     }
@@ -235,20 +226,64 @@ async function main() {
     );
 
     // Sim state (start balances)
-    let invA = num(process.env.BT_START_ADA, 100); // start A (ADA) human units if A=ADA; otherwise "A" units
-    let invB = num(process.env.BT_START_TOKB, 0);  // start B human units
+    let invA = num(process.env.BT_START_ADA, 100);
+    let invB = num(process.env.BT_START_TOKB, 0);
     const totalFeeBps = POOL_FEE_BPS + EXTRA_AGG_FEE_BPS;
 
-    // EMA center & cooldown
+    // EMA center & cooldown/cadence
     let center = series[0].mid;
     let lastTradeAt = 0;
 
-    let rollingMarkedAda = invA + (invB / series[0].mid); // value in A-terms (when A=ADA this is ADA)
+    // Decision cadence alignment
+    let nextDecisionAt = 0;
+    function alignNextDecision(ts: number) {
+        if (BT_DECISION_EVERY_MS <= 0) return;
+        const bucket = Math.floor(ts / BT_DECISION_EVERY_MS) + 1;
+        nextDecisionAt = bucket * BT_DECISION_EVERY_MS;
+    }
+    if (BT_DECISION_EVERY_MS > 0) alignNextDecision(series[0].t);
+
+    // Position memory
+    type PosMode = "LONG_A" | "LONG_B" | null;
+    let posMode: PosMode = null;
+    let entryMid = 0;
+    let peakMid = 0;
+    let troughMid = 0;
+
+    function favorableMoveBps(midNow: number) {
+        if (posMode === "LONG_B") return ((midNow - entryMid) / entryMid) * 10000;
+        if (posMode === "LONG_A") return ((entryMid - midNow) / entryMid) * 10000;
+        return 0;
+    }
+    function trailDrawdownBps(midNow: number) {
+        if (posMode === "LONG_B" && peakMid > 0) return ((peakMid - midNow) / peakMid) * 10000;
+        if (posMode === "LONG_A" && troughMid > 0) return ((midNow - troughMid) / troughMid) * 10000;
+        return 0;
+    }
+    function hardStopFromEntryBps(midNow: number) {
+        if (posMode === "LONG_B") return ((entryMid - midNow) / entryMid) * 10000;
+        if (posMode === "LONG_A") return ((midNow - entryMid) / entryMid) * 10000;
+        return 0;
+    }
+    function openPos(newMode: PosMode, midNow: number) {
+        posMode = newMode; entryMid = peakMid = troughMid = midNow;
+    }
+    function closePos() {
+        posMode = null; entryMid = peakMid = troughMid = 0;
+    }
+
+    let rollingMarkedAda = invA + (invB / series[0].mid);
 
     for (const { t, mid } of series) {
         // EMA update
         center = BAND_ALPHA * mid + (1 - BAND_ALPHA) * center;
         const { lower, upper } = bounds(center, BAND_BPS);
+
+        // Update extremes
+        if (posMode) {
+            peakMid   = Math.max(peakMid || mid, mid);
+            troughMid = Math.min(troughMid || mid, mid);
+        }
 
         // decision like bot
         let action: "HOLD" | "SELL_A" | "SELL_B" = "HOLD";
@@ -257,14 +292,45 @@ async function main() {
         if (mid > upper && overUpper >= EDGE_BPS) action = "SELL_A";
         else if (mid < lower && underLower >= EDGE_BPS) action = "SELL_B";
 
+        // cadence gate
+        if (BT_DECISION_EVERY_MS > 0 && t < nextDecisionAt) {
+            rollingMarkedAda = invA + (invB / mid);
+            continue;
+        }
+
+        // forced close via trailing/hard stop
+        let forcedClose: "SELL_A" | "SELL_B" | null = null;
+        if (posMode) {
+            const tdBps = TRAIL_STOP_BPS > 0 ? trailDrawdownBps(mid) : -1;
+            const hsBps = HARD_STOP_BPS  > 0 ? hardStopFromEntryBps(mid) : -1;
+            if ((TRAIL_STOP_BPS > 0 && tdBps >= TRAIL_STOP_BPS) || (HARD_STOP_BPS > 0 && hsBps >= HARD_STOP_BPS)) {
+                forcedClose = posMode === "LONG_B" ? "SELL_B" : "SELL_A";
+            }
+        }
+
+        let planned: "HOLD" | "SELL_A" | "SELL_B" = forcedClose ?? action;
+
         // cooldown
-        if (action !== "HOLD" && BT_COOLDOWN_MS > 0) {
+        if (planned !== "HOLD" && BT_COOLDOWN_MS > 0) {
             const remain = BT_COOLDOWN_MS - (t - lastTradeAt);
-            if (remain > 0) action = "HOLD";
+            if (remain > 0) planned = "HOLD";
+        }
+
+        // disallow add-to-same-side
+        if (posMode === "LONG_B" && planned === "SELL_A") planned = "HOLD";
+        if (posMode === "LONG_A" && planned === "SELL_B") planned = "HOLD";
+
+        // profit filter when closing a cycle
+        if (USE_CYCLE_FILTER && posMode && (
+            (posMode==="LONG_B" && planned==="SELL_B") ||
+            (posMode==="LONG_A" && planned==="SELL_A")
+        )) {
+            const need = MIN_CYCLE_PNL_BPS + EST_CYCLE_FEES_BPS;
+            if (favorableMoveBps(mid) < need && !forcedClose) planned = "HOLD";
         }
 
         // If no trade, just mark portfolio
-        if (action === "HOLD") {
+        if (planned === "HOLD") {
             rollingMarkedAda = invA + (invB / mid);
             continue;
         }
@@ -278,26 +344,27 @@ async function main() {
             /* aIsAda */ TOKEN_A_Q.toUpperCase() === "ADA"
         );
 
-        if (action === "SELL_A") {
+        if (planned === "SELL_A") {
             if (sizeA <= 0 || invA <= 0) { rollingMarkedAda = invA + (invB / mid); continue; }
 
-            // raw out in B (before fees) selling sizeA of A at mid
             const rawOutB = mid * sizeA;
-
-            // min_notional guard
             if (MIN_NOTIONAL_OUT > 0 && rawOutB < MIN_NOTIONAL_OUT) {
                 rollingMarkedAda = invA + (invB / mid);
                 continue;
             }
 
-            const outB = applyFeesOut(rawOutB, totalFeeBps);
-
-            // PnL in A-terms at mid: (B received in A) - A sold
+            const outB = applyFeesOut(rawOutB, POOL_FEE_BPS + EXTRA_AGG_FEE_BPS);
             const pnlAda = (outB / mid) - sizeA;
 
             invA -= sizeA;
             invB += outB;
             lastTradeAt = t;
+
+            if (BT_DECISION_EVERY_MS > 0) alignNextDecision(t);
+
+            // Position updates
+            if (posMode === "LONG_A") closePos();
+            if (posMode === null) openPos("LONG_B", mid);
 
             rollingMarkedAda = invA + (invB / mid);
 
@@ -312,7 +379,7 @@ async function main() {
                 TOKEN_A_Q,
                 outB,
                 TOKEN_B_Q,
-                totalFeeBps,
+                POOL_FEE_BPS + EXTRA_AGG_FEE_BPS,
                 pnlAda,
                 rollingMarkedAda
             ]);
@@ -320,22 +387,24 @@ async function main() {
             // SELL_B
             if (sizeB <= 0 || invB <= 0) { rollingMarkedAda = invA + (invB / mid); continue; }
 
-            // raw out in A selling sizeB of B at mid
             const rawOutA = sizeB / mid;
-
             if (MIN_NOTIONAL_OUT > 0 && rawOutA < MIN_NOTIONAL_OUT) {
                 rollingMarkedAda = invA + (invB / mid);
                 continue;
             }
 
-            const outA = applyFeesOut(rawOutA, totalFeeBps);
-
-            // PnL in A-terms: A received - A value of B sold at mid
+            const outA = applyFeesOut(rawOutA, POOL_FEE_BPS + EXTRA_AGG_FEE_BPS);
             const pnlAda = outA - (sizeB / mid);
 
             invB -= sizeB;
             invA += outA;
             lastTradeAt = t;
+
+            if (BT_DECISION_EVERY_MS > 0) alignNextDecision(t);
+
+            // Position updates
+            if (posMode === "LONG_B") closePos();
+            if (posMode === null) openPos("LONG_A", mid);
 
             rollingMarkedAda = invA + (invB / mid);
 
@@ -350,7 +419,7 @@ async function main() {
                 TOKEN_B_Q,
                 outA,
                 TOKEN_A_Q,
-                totalFeeBps,
+                POOL_FEE_BPS + EXTRA_AGG_FEE_BPS,
                 pnlAda,
                 rollingMarkedAda
             ]);

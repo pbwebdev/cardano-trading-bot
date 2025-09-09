@@ -6,9 +6,7 @@ import axios from "axios";
 
 /**
  * Grid-sweeps EMA-band strategy with dynamic, balance-aware sizing to mirror src/bot-twoway.ts.
- * - Reuses TapTools candles for all runs
- * - Sizing: % of inventory with floors, ADA reserve, and fixed caps (AMOUNT_*_DEC)
- * - Outputs per-run summary to sweep_results.csv
+ * Adds decision cadence + cycle profit filter + trailing/hard stops.
  */
 
 type Net = "Mainnet" | "Preprod" | "Preview";
@@ -53,7 +51,16 @@ const MAX_PCT_A_LIST   = parseList(process.env.SWEEP_MAX_PCT_A, [10, 15, 20]);
 const MAX_PCT_B_LIST   = parseList(process.env.SWEEP_MAX_PCT_B, [10, 15, 20]);
 const MIN_TR_A_LIST    = parseList(process.env.SWEEP_MIN_TRADE_A, [5]);
 const MIN_TR_B_LIST    = parseList(process.env.SWEEP_MIN_TRADE_B, [50]);
-const COOLDOWN_LIST    = parseList(process.env.SWEEP_COOLDOWN_MS, [0]); // mirror bot throttle (ms)
+const COOLDOWN_LIST    = parseList(process.env.SWEEP_COOLDOWN_MS, [0]); // throttle (ms)
+
+// Decision cadence list (ms) – e.g. "0,14400000"
+const DECISION_MS_LIST = parseList(process.env.SWEEP_DECISION_EVERY_MS, [0]);
+
+// NEW: profit filter/stop sweeps
+const MIN_CYCLE_BPS_LIST = parseList(process.env.SWEEP_MIN_CYCLE_PNL_BPS, [0]);
+const TRAIL_BPS_LIST     = parseList(process.env.SWEEP_TRAIL_STOP_BPS, [0]);
+const HARD_BPS_LIST      = parseList(process.env.SWEEP_HARD_STOP_BPS, [0]);
+const EST_FEES_BPS       = num(process.env.EST_CYCLE_FEES_BPS, 60); // constant across grid
 
 const OUT = path.join(process.cwd(), "sweep_results.csv");
 ensureHeader(
@@ -64,6 +71,7 @@ ensureHeader(
         "band_bps","edge_bps","alpha",
         "max_pct_a","max_pct_b","min_tr_a","min_tr_b",
         "cap_a","cap_b","reserve_ada","pool_fee_bps","agg_fee_bps","cooldown_ms",
+        "decision_ms","min_cycle_bps","trail_bps","hard_bps","est_fees_bps",
         "start_a","start_b",
         "end_a","end_b","end_marked_ada","pnl_ada","max_dd_ada",
         "trades","sell_a","sell_b","wins","losses","winrate","avg_pnl_trade"
@@ -197,12 +205,40 @@ function runBacktest(
         capA: number; capB: number;
         maxPctA: number; maxPctB: number; minTrA: number; minTrB: number;
         aIsAda: boolean;
+        decisionEveryMs: number; // cadence
+        // new filter/stop params
+        minCycleBps: number; trailBps: number; hardBps: number; estFeesBps: number;
     }
 ) {
     let invA = START_A;
     let invB = START_B;
     let center = series[0].mid;
     let lastTradeAt = 0;
+
+    // cadence state
+    let nextDecisionAt = 0;
+    function alignNextDecision(ts: number) {
+        if (params.decisionEveryMs <= 0) return;
+        const bucket = Math.floor(ts / params.decisionEveryMs) + 1;
+        nextDecisionAt = bucket * params.decisionEveryMs;
+    }
+    if (params.decisionEveryMs > 0) alignNextDecision(series[0].t);
+
+    // position memory
+    type PosMode = "LONG_A" | "LONG_B" | null;
+    let posMode: PosMode = null;
+    let entryMid = 0, peakMid = 0, troughMid = 0;
+    const favMove = (m: number) =>
+        posMode === "LONG_B" ? ((m - entryMid) / entryMid) * 10000 :
+            posMode === "LONG_A" ? ((entryMid - m) / entryMid) * 10000 : 0;
+    const trailDD = (m: number) =>
+        posMode === "LONG_B" && peakMid > 0 ? ((peakMid - m) / peakMid) * 10000 :
+            posMode === "LONG_A" && troughMid > 0 ? ((m - troughMid) / troughMid) * 10000 : 0;
+    const hardLoss = (m: number) =>
+        posMode === "LONG_B" ? ((entryMid - m) / entryMid) * 10000 :
+            posMode === "LONG_A" ? ((m - entryMid) / entryMid) * 10000 : 0;
+    const openPos = (pm: PosMode, m: number) => { posMode = pm; entryMid = peakMid = troughMid = m; };
+    const closePos = () => { posMode = null; entryMid = peakMid = troughMid = 0; };
 
     let trades = 0, sellA = 0, sellB = 0, wins = 0, losses = 0;
     let peakMarked = invA + (invB / series[0].mid);
@@ -212,79 +248,97 @@ function runBacktest(
         center = params.alpha * mid + (1 - params.alpha) * center;
         const { lower, upper } = bounds(center, params.bandBps);
 
+        if (posMode) { peakMid = Math.max(peakMid || mid, mid); troughMid = Math.min(troughMid || mid, mid); }
+
         let action: "HOLD" | "SELL_A" | "SELL_B" = "HOLD";
         const overUpper = bpsOver(mid, upper);
         const underLower = bpsOver(lower, mid);
         if (mid > upper && overUpper >= params.edgeBps) action = "SELL_A";
         else if (mid < lower && underLower >= params.edgeBps) action = "SELL_B";
 
-        if (action !== "HOLD" && params.cooldownMs > 0) {
-            const remain = params.cooldownMs - (t - lastTradeAt);
-            if (remain > 0) action = "HOLD";
-        }
-
-        if (action === "HOLD") {
+        // cadence gate
+        if (params.decisionEveryMs > 0 && t < nextDecisionAt) {
             const marked = invA + (invB / mid);
             peakMarked = Math.max(peakMarked, marked);
             maxDD = Math.max(maxDD, peakMarked - marked);
             continue;
         }
 
-        // Dynamic size based on current inventory
+        // forced close via stops
+        let forcedClose: "SELL_A" | "SELL_B" | null = null;
+        if (posMode) {
+            const td = params.trailBps > 0 ? trailDD(mid) : -1;
+            const hs = params.hardBps  > 0 ? hardLoss(mid) : -1;
+            if ((params.trailBps > 0 && td >= params.trailBps) || (params.hardBps > 0 && hs >= params.hardBps)) {
+                forcedClose = posMode === "LONG_B" ? "SELL_B" : "SELL_A";
+            }
+        }
+
+        let planned: "HOLD" | "SELL_A" | "SELL_B" = forcedClose ?? action;
+
+        // cooldown
+        if (planned !== "HOLD" && params.cooldownMs > 0) {
+            const remain = params.cooldownMs - (t - lastTradeAt);
+            if (remain > 0) planned = "HOLD";
+        }
+
+        // disallow add-to-same-side
+        if (posMode === "LONG_B" && planned === "SELL_A") planned = "HOLD";
+        if (posMode === "LONG_A" && planned === "SELL_B") planned = "HOLD";
+
+        // profit filter on cycle close
+        if (posMode && ((posMode==="LONG_B" && planned==="SELL_B") || (posMode==="LONG_A" && planned==="SELL_A"))) {
+            const need = params.minCycleBps + params.estFeesBps;
+            if (favMove(mid) < need && !forcedClose) planned = "HOLD";
+        }
+
+        if (planned === "HOLD") {
+            const marked = invA + (invB / mid);
+            peakMarked = Math.max(peakMarked, marked);
+            maxDD = Math.max(maxDD, peakMarked - marked);
+            continue;
+        }
+
+        // Dynamic size
         const { sizeA, sizeB } = computeDynamicSizesFromInventory(
             invA, invB, params.aIsAda,
             { capA: params.capA, capB: params.capB },
             { maxPctA: params.maxPctA, maxPctB: params.maxPctB, minTrA: params.minTrA, minTrB: params.minTrB }
         );
 
-        if (action === "SELL_A") {
-            if (sizeA <= 0 || invA <= 0) {
-                const marked = invA + (invB / mid);
-                peakMarked = Math.max(peakMarked, marked);
-                maxDD = Math.max(maxDD, peakMarked - marked);
-                continue;
-            }
+        if (planned === "SELL_A") {
+            if (sizeA <= 0 || invA <= 0) { const m = invA + (invB / mid); peakMarked = Math.max(peakMarked, m); maxDD = Math.max(maxDD, peakMarked - m); continue; }
             const rawOutB = mid * sizeA;
-            if (MIN_NOTIONAL_OUT > 0 && rawOutB < MIN_NOTIONAL_OUT) {
-                const marked = invA + (invB / mid);
-                peakMarked = Math.max(peakMarked, marked);
-                maxDD = Math.max(maxDD, peakMarked - marked);
-                continue;
-            }
+            if (MIN_NOTIONAL_OUT > 0 && rawOutB < MIN_NOTIONAL_OUT) { const m = invA + (invB / mid); peakMarked = Math.max(peakMarked, m); maxDD = Math.max(maxDD, peakMarked - m); continue; }
             const outB = applyFeesOut(rawOutB, TOTAL_FEE_BPS);
             const pnlAda = (outB / mid) - sizeA;
 
             invA -= sizeA;
             invB += outB;
             lastTradeAt = t;
+            if (params.decisionEveryMs > 0) alignNextDecision(t);
 
-            trades++; sellA++;
-            if (pnlAda > 0) wins++; else if (pnlAda < 0) losses++;
+            if (posMode === "LONG_A") closePos();
+            if (posMode === null) openPos("LONG_B", mid);
+
+            trades++; sellA++; if (pnlAda > 0) wins++; else if (pnlAda < 0) losses++;
 
         } else {
-            // SELL_B
-            if (sizeB <= 0 || invB <= 0) {
-                const marked = invA + (invB / mid);
-                peakMarked = Math.max(peakMarked, marked);
-                maxDD = Math.max(maxDD, peakMarked - marked);
-                continue;
-            }
+            if (sizeB <= 0 || invB <= 0) { const m = invA + (invB / mid); peakMarked = Math.max(peakMarked, m); maxDD = Math.max(maxDD, peakMarked - m); continue; }
             const rawOutA = sizeB / mid;
-            if (MIN_NOTIONAL_OUT > 0 && rawOutA < MIN_NOTIONAL_OUT) {
-                const marked = invA + (invB / mid);
-                peakMarked = Math.max(peakMarked, marked);
-                maxDD = Math.max(maxDD, peakMarked - marked);
-                continue;
-            }
+            if (MIN_NOTIONAL_OUT > 0 && rawOutA < MIN_NOTIONAL_OUT) { const m = invA + (invB / mid); peakMarked = Math.max(peakMarked, m); maxDD = Math.max(maxDD, peakMarked - m); continue; }
             const outA = applyFeesOut(rawOutA, TOTAL_FEE_BPS);
             const pnlAda = outA - (sizeB / mid);
 
             invB -= sizeB;
             invA += outA;
             lastTradeAt = t;
+            if (params.decisionEveryMs > 0) alignNextDecision(t);
 
-            trades++; sellB++;
-            if (pnlAda > 0) wins++; else if (pnlAda < 0) losses++;
+            if (posMode === "LONG_B") closePos();
+            if (posMode === null) openPos("LONG_A", mid);
+
+            trades++; sellB++; if (pnlAda > 0) wins++; else if (pnlAda < 0) losses++;
         }
 
         const marked = invA + (invB / mid);
@@ -338,7 +392,7 @@ async function main() {
 
     const tsRun = new Date().toISOString();
 
-    // Grid
+    // Grid (includes cadence + filters/stops)
     for (const bandBps of BAND_BPS_LIST) {
         for (const edgeBps of EDGE_BPS_LIST) {
             for (const alpha of ALPHA_LIST) {
@@ -347,24 +401,36 @@ async function main() {
                         for (const minTrA of MIN_TR_A_LIST) {
                             for (const minTrB of MIN_TR_B_LIST) {
                                 for (const cooldownMs of COOLDOWN_LIST) {
+                                    for (const decisionMs of DECISION_MS_LIST) {
+                                        for (const minCycleBps of MIN_CYCLE_BPS_LIST) {
+                                            for (const trailBps of TRAIL_BPS_LIST) {
+                                                for (const hardBps of HARD_BPS_LIST) {
 
-                                    const res = runBacktest(baseSeries, {
-                                        bandBps, alpha, edgeBps, cooldownMs,
-                                        capA: CAP_A, capB: CAP_B,
-                                        maxPctA, maxPctB, minTrA, minTrB,
-                                        aIsAda: TOKEN_A_Q.toUpperCase() === "ADA",
-                                    });
+                                                    const res = runBacktest(baseSeries, {
+                                                        bandBps, alpha, edgeBps, cooldownMs,
+                                                        capA: CAP_A, capB: CAP_B,
+                                                        maxPctA, maxPctB, minTrA, minTrB,
+                                                        aIsAda: TOKEN_A_Q.toUpperCase() === "ADA",
+                                                        decisionEveryMs: decisionMs,
+                                                        minCycleBps, trailBps, hardBps, estFeesBps: EST_FEES_BPS,
+                                                    });
 
-                                    appendCsv(OUT, [
-                                        tsRun, INTERVAL, points,
-                                        TOKEN_A_Q, TOKEN_B_Q,
-                                        bandBps, edgeBps, alpha,
-                                        maxPctA, maxPctB, minTrA, minTrB,
-                                        CAP_A, CAP_B, RESERVE_ADA_DEC, POOL_FEE_BPS, EXTRA_AGG_FEE_BPS, cooldownMs,
-                                        START_A, START_B,
-                                        fix(res.endA, 6), fix(res.endB, 6), fix(res.endMarked, 6), fix(res.pnlAda, 6), fix(res.maxDD, 6),
-                                        res.trades, res.sellA, res.sellB, res.wins, res.losses, fix(res.winrate, 4), fix(res.avgPnL, 6),
-                                    ]);
+                                                    appendCsv(OUT, [
+                                                        tsRun, INTERVAL, points,
+                                                        TOKEN_A_Q, TOKEN_B_Q,
+                                                        bandBps, edgeBps, alpha,
+                                                        maxPctA, maxPctB, minTrA, minTrB,
+                                                        CAP_A, CAP_B, RESERVE_ADA_DEC, POOL_FEE_BPS, EXTRA_AGG_FEE_BPS, cooldownMs,
+                                                        decisionMs, minCycleBps, trailBps, hardBps, EST_FEES_BPS,
+                                                        START_A, START_B,
+                                                        fix(res.endA, 6), fix(res.endB, 6), fix(res.endMarked, 6), fix(res.pnlAda, 6), fix(res.maxDD, 6),
+                                                        res.trades, res.sellA, res.sellB, res.wins, res.losses, fix(res.winrate, 4), fix(res.avgPnL, 6),
+                                                    ]);
+
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

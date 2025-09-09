@@ -37,6 +37,9 @@ const EDGE_BPS    = num(process.env.EDGE_BPS, 5);           // extra distance be
 const COOLDOWN_MS = num(process.env.COOLDOWN_MS, 45000);    // throttle after a fill
 const POLL_MS     = num(process.env.POLL_MS, 60000);
 
+// Decision cadence (0 disables; e.g., 14_400_000 = 4h)
+const DECISION_EVERY_MS = num(process.env.DECISION_EVERY_MS, 0);
+
 // Guards
 const MIN_NOTIONAL_OUT = num(process.env.MIN_NOTIONAL_OUT, 0); // skip if out < this (human units)
 const RESERVE_ADA_DEC  = num(process.env.RESERVE_ADA_DEC, 0);  // keep at least this many ADA
@@ -50,6 +53,13 @@ const MIN_TRADE_B_DEC = num(process.env.MIN_TRADE_B_DEC, 50);
 // Runtime
 const DRY_RUN   = (process.env.DRY_RUN ?? "true").toLowerCase() === "true";
 const ONLY_VERI = (process.env.ONLY_VERIFIED ?? "true").toLowerCase() === "true";
+
+// NEW: profit filter & stops (0 = disabled)
+const USE_CYCLE_FILTER   = (process.env.USE_CYCLE_FILTER ?? "true").toLowerCase() === "true";
+const MIN_CYCLE_PNL_BPS  = num(process.env.MIN_CYCLE_PNL_BPS, 0);   // extra beyond fees
+const EST_CYCLE_FEES_BPS = num(process.env.EST_CYCLE_FEES_BPS, 60); // est round-trip fees
+const TRAIL_STOP_BPS     = num(process.env.TRAIL_STOP_BPS, 0);      // trailing giveback
+const HARD_STOP_BPS      = num(process.env.HARD_STOP_BPS, 0);       // from entry
 
 // Logs
 const LOG = path.join(process.cwd(), process.env.LOG ?? "fills.csv");
@@ -340,6 +350,36 @@ async function computeDynamicTradeSizes(
     return { tradeA_str, tradeB_str, tradeA_num, tradeB_num };
 }
 
+/* ---------- position memory (cycle filter + trailing/hard stops) ---------- */
+type PosMode = "LONG_A" | "LONG_B" | null; // LONG_B means last SELL_A (holding B), LONG_A means last SELL_B
+let posMode: PosMode = null;
+let entryMid = 0;     // mid at entry
+let peakMid  = 0;     // best favorable mid since entry
+let troughMid = 0;    // best favorable mid for LONG_A (down-move)
+
+function favorableMoveBps(midNow: number) {
+    if (posMode === "LONG_B") return ((midNow - entryMid) / entryMid) * 10000; // up is good
+    if (posMode === "LONG_A") return ((entryMid - midNow) / entryMid) * 10000; // down is good
+    return 0;
+}
+function trailDrawdownBps(midNow: number) {
+    if (posMode === "LONG_B" && peakMid > 0) return ((peakMid - midNow) / peakMid) * 10000;
+    if (posMode === "LONG_A" && troughMid > 0) return ((midNow - troughMid) / troughMid) * 10000;
+    return 0;
+}
+function hardStopFromEntryBps(midNow: number) {
+    if (posMode === "LONG_B") return ((entryMid - midNow) / entryMid) * 10000; // down is bad
+    if (posMode === "LONG_A") return ((midNow - entryMid) / entryMid) * 10000; // up is bad
+    return 0;
+}
+function openPos(newMode: PosMode, midNow: number) {
+    posMode = newMode;
+    entryMid = peakMid = troughMid = midNow;
+}
+function closePos() {
+    posMode = null; entryMid = peakMid = troughMid = 0;
+}
+
 let centerGlobal: number | null = null;  // for SIGINT persistence
 
 async function main() {
@@ -370,9 +410,22 @@ async function main() {
 
     let lastTradeAt = 0;
 
+    // Decision cadence state
+    let nextDecisionAt = 0;
+    function alignNextDecision(nowMs: number) {
+        if (DECISION_EVERY_MS <= 0) return;
+        const bucket = Math.floor(nowMs / DECISION_EVERY_MS) + 1;
+        nextDecisionAt = bucket * DECISION_EVERY_MS;
+    }
+
     // eslint-disable-next-line no-constant-condition
     while (true) {
         try {
+            const now = Date.now();
+            if (DECISION_EVERY_MS > 0 && nextDecisionAt === 0) {
+                alignNextDecision(now); // first alignment on startup
+            }
+
             const capA = Number(AMOUNT_A_DEC);
             const capB = Number(AMOUNT_B_DEC);
 
@@ -412,14 +465,55 @@ async function main() {
                 `[tick] mid≈ ${mid.toFixed(8)} ${TOKEN_B_Q}/${TOKEN_A_Q} | band [${lower.toFixed(8)}, ${upper.toFixed(8)}] | center≈ ${center.toFixed(8)}`
             );
 
-            // 4) Decide action
+            // Update trailing extremes for open position
+            if (posMode) {
+                peakMid   = Math.max(peakMid || mid, mid);
+                troughMid = Math.min(troughMid || mid, mid);
+            }
+
+            // 4) Decide action from band/edge
             let action: "SELL_A" | "SELL_B" | "HOLD" = "HOLD";
             const overUpperBps = bpsOver(mid, upper);
             const underLowerBps = bpsOver(lower, mid);
             if (mid > upper && overUpperBps >= EDGE_BPS) action = "SELL_A";
             else if (mid < lower && underLowerBps >= EDGE_BPS) action = "SELL_B";
 
-            if (action === "HOLD" || (action === "SELL_A" && smallAB) || (action === "SELL_B" && smallBA)) {
+            // Decision cadence gate – only act when the window opens
+            if (DECISION_EVERY_MS > 0 && now < nextDecisionAt) {
+                await new Promise((r) => setTimeout(r, POLL_MS));
+                continue;
+            }
+
+            // --- optional forced close via trailing/hard stop (pre-empts band) ---
+            let forcedClose: "SELL_A" | "SELL_B" | null = null;
+            if (posMode) {
+                const tdBps = TRAIL_STOP_BPS > 0 ? trailDrawdownBps(mid) : -1;
+                const hsBps = HARD_STOP_BPS  > 0 ? hardStopFromEntryBps(mid) : -1;
+                if ((TRAIL_STOP_BPS > 0 && tdBps >= TRAIL_STOP_BPS) || (HARD_STOP_BPS > 0 && hsBps >= HARD_STOP_BPS)) {
+                    forcedClose = posMode === "LONG_B" ? "SELL_B" : "SELL_A";
+                }
+            }
+
+            // Compose planned action
+            let planned: "SELL_A" | "SELL_B" | "HOLD" = forcedClose ?? action;
+
+            // Disallow adding to same side while a position is open (single-position policy)
+            if (posMode === "LONG_B" && planned === "SELL_A") planned = "HOLD";
+            if (posMode === "LONG_A" && planned === "SELL_B") planned = "HOLD";
+
+            // Profit filter when attempting to close a cycle
+            if (USE_CYCLE_FILTER && posMode && (
+                (posMode === "LONG_B" && planned === "SELL_B") ||
+                (posMode === "LONG_A" && planned === "SELL_A")
+            )) {
+                const need = MIN_CYCLE_PNL_BPS + EST_CYCLE_FEES_BPS;
+                if (favorableMoveBps(mid) < need && !forcedClose) {
+                    planned = "HOLD";
+                }
+            }
+
+            // Existing notional guards
+            if (planned === "HOLD" || (planned === "SELL_A" && smallAB) || (planned === "SELL_B" && smallBA)) {
                 await new Promise((r) => setTimeout(r, POLL_MS));
                 continue;
             }
@@ -437,7 +531,7 @@ async function main() {
 
             // 6) Compute dynamic sizes off live balances (floors/ceilings/reserve)
             const { tradeA_str, tradeB_str, tradeA_num, tradeB_num } =
-                await computeDynamicTradeSizes(lucid, unitA, decA, unitB, decB, { AMOUNT_A_DEC: capA, AMOUNT_B_DEC: capB });
+                await computeDynamicTradeSizes(lucid, unitA, decA, unitB, decB, { AMOUNT_A_DEC: Number(AMOUNT_A_DEC), AMOUNT_B_DEC: Number(AMOUNT_B_DEC) });
 
             if (tradeA_num <= 0 && tradeB_num <= 0) {
                 console.log("[sizing] no available size (after reserve/floors) — holding");
@@ -446,7 +540,7 @@ async function main() {
             }
 
             // 7) Re-estimate for the chosen side using the dynamic size, then execute
-            if (action === "SELL_A") {
+            if (planned === "SELL_A") {
                 // ADA reserve guard if A is ADA (uses dynamic size)
                 if (unitA === "lovelace") {
                     const buf = 2_000_000n; // fee buffer
@@ -492,8 +586,13 @@ async function main() {
                     logFill("SELL_A", tradeA_str, TOKEN_A_Q, String(minOutB_human), TOKEN_B_Q, tx, mid, pnlADA);
 
                     lastTradeAt = Date.now();
+                    if (DECISION_EVERY_MS > 0) alignNextDecision(lastTradeAt);
+
+                    // Position updates
+                    if (posMode === "LONG_A") closePos();
+                    if (posMode === null) openPos("LONG_B", mid);
                 }
-            } else if (action === "SELL_B") {
+            } else if (planned === "SELL_B") {
                 if (unitB === "lovelace") {
                     const buf = 2_000_000n;
                     const required = BigInt(Math.round(tradeB_num * 1_000_000)) + buf;
@@ -531,6 +630,11 @@ async function main() {
                     logFill("SELL_B", tradeB_str, TOKEN_B_Q, String(minOutA_human), TOKEN_A_Q, tx, mid, pnlADA);
 
                     lastTradeAt = Date.now();
+                    if (DECISION_EVERY_MS > 0) alignNextDecision(lastTradeAt);
+
+                    // Position updates
+                    if (posMode === "LONG_B") closePos();
+                    if (posMode === null) openPos("LONG_A", mid);
                 }
             }
 
