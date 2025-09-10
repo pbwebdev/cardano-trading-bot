@@ -9,6 +9,11 @@ import { blake2b } from "blakejs";
 import fs from "node:fs";
 import path from "node:path";
 
+console.info("[env] DOTENV_CONFIG_PATH=", process.env.DOTENV_CONFIG_PATH);
+console.info("[env] DRY_RUN(raw)=", process.env.DRY_RUN);
+const DRY_RUN = (process.env.DRY_RUN ?? "false").toLowerCase() === "true"; // single source of truth
+console.info("[env] DRY_RUN(resolved)=", DRY_RUN);
+
 type Net = "Mainnet" | "Preprod" | "Preview";
 const NETWORK = (process.env.NETWORK ?? "Mainnet") as Net;
 const AGG = "https://agg-api.minswap.org/aggregator";
@@ -51,7 +56,6 @@ const MIN_TRADE_A_DEC = num(process.env.MIN_TRADE_A_DEC, 5);
 const MIN_TRADE_B_DEC = num(process.env.MIN_TRADE_B_DEC, 50);
 
 // Runtime
-const DRY_RUN   = (process.env.DRY_RUN ?? "true").toLowerCase() === "true";
 const ONLY_VERI = (process.env.ONLY_VERIFIED ?? "true").toLowerCase() === "true";
 
 // NEW: profit filter & stops (0 = disabled)
@@ -114,10 +118,9 @@ async function resolveTokenId(query: string): Promise<string> {
 }
 
 // --- decimals/meta (needed for human-sizing of token balances) ---
-function isUnitLike(s: string) { return /^[0-9a-f]{56}\.[0-9a-f]+$/i.test(s); }
 async function resolveTokenMeta(query: string): Promise<{ unit: string; decimals: number; ticker?: string }> {
     if (query.toUpperCase() === "ADA") return { unit: "lovelace", decimals: 6, ticker: "ADA" };
-    if (isUnitLike(query)) return { unit: query, decimals: 0 };
+    if (isUnit(query)) return { unit: query, decimals: 0 };
     try {
         const resp = await axios.post(`${AGG}/tokens`, { query, only_verified: ONLY_VERI });
         const items: any[] = resp.data?.tokens ?? [];
@@ -182,7 +185,15 @@ async function estimate(fromUnit: string, toUnit: string, amountDecimal: string)
     return { req, res };
 }
 
-// Normalize min_amount_out to **integer** base units (string) for build-tx
+// ---------- unit conversion & sanitisation helpers ----------
+function toBaseUnits(human: string | number, decimals: number): string {
+    const n = Number(human);
+    if (!Number.isFinite(n)) throw new Error(`toBaseUnits bad number: ${human}`);
+    const scaled = Math.floor(n * Math.pow(10, Math.max(0, decimals || 0)));
+    return String(scaled); // integer string
+}
+
+// Normalize min_amount_out to **integer** base units (string) for build-tx (top-level)
 function normalizeMinOut(estRes: any): string {
     const candidates = [
         estRes.min_amount_out,
@@ -195,17 +206,14 @@ function normalizeMinOut(estRes: any): string {
         throw new Error("estimate response missing min_amount_out");
     }
 
-    let raw = String(candidates[0]);
+    const raw = String(candidates[0]);
     if (!raw.includes(".")) return raw; // already integer
 
     const decimals = Number(estRes.token_out_decimals ?? estRes.decimals_out ?? estRes.decimals ?? 0);
-    const val = Number(raw);
-    if (!Number.isFinite(val)) throw new Error(`min_amount_out not a number: ${raw}`);
-    const scaled = Math.floor(val * Math.pow(10, decimals));
-    return BigInt(scaled).toString();
+    return toBaseUnits(raw, decimals);
 }
 
-// Convert min_amount_out (on-chain integer or decimal) to **human units** for PnL
+// Convert min_amount_out (on-chain integer or decimal) to **human units** for PnL/guards
 function humanMinOut(estRes: any): number {
     if (estRes.min_amount_out_human !== undefined) return Number(estRes.min_amount_out_human);
 
@@ -216,15 +224,52 @@ function humanMinOut(estRes: any): number {
     if (s.includes(".")) return Number(s); // already human
 
     const decimals = Number(estRes.token_out_decimals ?? estRes.decimals_out ?? estRes.decimals ?? 0);
-    return Number(BigInt(s)) / Math.pow(10, decimals);
+    // avoid Number(BigInt) direct for huge values by dividing in JS after parsing
+    const intStr = s.replace(/^0+/, "") || "0";
+    const intNum = Number(intStr); // safe for 6-dec tokens typical on Cardano
+    return intNum / Math.pow(10, decimals);
+}
+
+// Sanitize the nested estimate object we send to /build-tx
+function sanitizeEstimateForBuild(estReq: any, estRes: any) {
+    const decIn  = Number(estRes.token_in_decimals  ?? estRes.decimals_in  ?? 0);
+    const decOut = Number(estRes.token_out_decimals ?? estRes.decimals_out ?? estRes.decimals ?? 0);
+
+    const amountBase = toBaseUnits(estReq.amount, decIn);
+
+    const moCandidates = [
+        estRes.min_amount_out,
+        estRes.min_amount_out_units,
+        estRes.min_amount_out_onchain,
+        estRes.amount_out_min
+    ].filter((v: any) => v !== undefined && v !== null);
+
+    const minOutHumanOrBase = String(moCandidates[0] ?? "");
+    const minOutBase = minOutHumanOrBase.includes(".")
+        ? toBaseUnits(minOutHumanOrBase, decOut)
+        : minOutHumanOrBase;
+
+    const clean: any = {
+        ...estRes,
+        amount: amountBase,          // integer
+        amount_in_decimal: false,    // explicitly not decimal
+        min_amount_out: minOutBase,  // integers everywhere
+        min_amount_out_units: minOutBase,
+        amount_out_min: minOutBase,
+    };
+
+    delete clean.min_amount_out_human; // avoid server reading a float variant
+    return clean;
 }
 
 async function executeSwap(sender: string, estReq: any, estRes: any): Promise<string> {
-    const minOutFixed = normalizeMinOut(estRes);
+    const minOutFixed = normalizeMinOut(estRes);               // integer string, top-level
+    const estimateClean = sanitizeEstimateForBuild(estReq, estRes); // nested estimate integer-safe
+
     const build = (await axios.post(`${AGG}/build-tx`, {
         sender,
         min_amount_out: minOutFixed,
-        estimate: { ...estReq, ...estRes },
+        estimate: estimateClean,
     })).data;
 
     const unsignedCborHex: string = build.cbor;
@@ -435,20 +480,12 @@ async function main() {
                 estimate(unitB, unitA, AMOUNT_B_DEC),
             ]);
 
-            const minOutAB = Number(resAB_caps.min_amount_out);
-            const minOutBA = Number(resBA_caps.min_amount_out);
-            if (!Number.isFinite(minOutAB) || !Number.isFinite(minOutBA)) {
-                throw new Error(`Bad min_amount_out: A->B=${resAB_caps.min_amount_out} B->A=${resBA_caps.min_amount_out}`);
-            }
-
-            // Optional notional guard (in token_out human units)
-            const smallAB = MIN_NOTIONAL_OUT > 0 && minOutAB < MIN_NOTIONAL_OUT;
-            const smallBA = MIN_NOTIONAL_OUT > 0 && minOutBA < MIN_NOTIONAL_OUT;
-            if (smallAB) console.log(`[guard] A->B min_out ${minOutAB} < ${MIN_NOTIONAL_OUT} — holding`);
-            if (smallBA) console.log(`[guard] B->A min_out ${minOutBA} < ${MIN_NOTIONAL_OUT} — holding`);
+            // Use humanised min_out for guard comparisons (avoid Number(BigInt) pitfalls)
+            const minOutAB_h = humanMinOut(resAB_caps);
+            const minOutBA_h = humanMinOut(resBA_caps);
 
             // 2) Mid price (TOKEN_B per TOKEN_A) using caps for stability
-            const mid = deriveMid(minOutAB, minOutBA, capA, capB);
+            const mid = deriveMid(minOutAB_h, minOutBA_h, capA, capB);
 
             // 3) EMA center update
             if (!Number.isFinite(center)) {
@@ -512,7 +549,13 @@ async function main() {
                 }
             }
 
-            // Existing notional guards
+            // Optional notional guards (in token_out human units)
+            const smallAB = MIN_NOTIONAL_OUT > 0 && minOutAB_h < MIN_NOTIONAL_OUT;
+            const smallBA = MIN_NOTIONAL_OUT > 0 && minOutBA_h < MIN_NOTIONAL_OUT;
+            if (smallAB) console.log(`[guard] A->B min_out ${minOutAB_h} < ${MIN_NOTIONAL_OUT} — holding`);
+            if (smallBA) console.log(`[guard] B->A min_out ${minOutBA_h} < ${MIN_NOTIONAL_OUT} — holding`);
+
+            // Existing guards
             if (planned === "HOLD" || (planned === "SELL_A" && smallAB) || (planned === "SELL_B" && smallBA)) {
                 await new Promise((r) => setTimeout(r, POLL_MS));
                 continue;
