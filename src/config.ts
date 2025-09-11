@@ -34,6 +34,11 @@ const schema = z.object({
     POLL_MS: z.coerce.number().default(30000),
     COOLDOWN_MS: z.coerce.number().default(90000),
 
+    // add under // loop
+    DECISION_EVERY_MS: z.coerce.number().default(0), // 0 = decide every tick
+    CANDLE_MS: z.coerce.number().default(0),         // 0 = no candle aggregation (use ticks)
+
+
     // confirmations (optional)
     WAIT_FOR_CONFIRMATIONS: z.coerce.number().default(0),
     CONFIRM_TIMEOUT_MS: z.coerce.number().default(180000),
