@@ -48,7 +48,15 @@ export async function runBot() {
     const candleMs =
         (cfg.CANDLE_MS > 0 ? cfg.CANDLE_MS : 0) ||
         (decisionEvery > 0 ? decisionEvery : 0); // default: tie candles to decision cadence when provided
-
+    log.info("[cadence]", {
+        candleMs,
+        decisionEvery,
+        pollMs: cfg.POLL_MS,
+        cooldownMs: cfg.COOLDOWN_MS,
+        candleH: candleMs ? (candleMs / 3_600_000).toFixed(2) : "0",
+        decisionH: decisionEvery ? (decisionEvery / 3_600_000).toFixed(2) : "0",
+    });
+    
     // State
     let band = loadCenter(cfg.CENTER_FILE);
     let center = band?.center ?? null;
