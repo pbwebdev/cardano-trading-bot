@@ -207,8 +207,9 @@ function rollCandle(
 
     // close and roll forward if elapsed
     while (now >= cur.end) {
-        onClose(cur);
-        const nextStart = cur.end;
+        const closed: Candle = cur;              // <-- annotate the closed candle
+        onClose(closed);
+        const nextStart: number = closed.end;    // <-- explicit type fixes TS7022
         cur = { start: nextStart, end: nextStart + candleMs, o: price, h: price, l: price, c: price };
     }
 
