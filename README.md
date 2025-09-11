@@ -1,123 +1,168 @@
-## Cardano Trading Bot
+# Cardano Trading Bot
 
-This bot automates DeFi trading on Cardano using an EMA band strategy with risk controls. It integrates with the Minswap DEX Aggregator API for routing and TapTools for historical price data used in backtests and parameter sweeps.
+Automate trading on the Cardano blockchain using Minswap’s Aggregator API for the best swap prices and TapTools API for backtesting.  
+This bot implements an EMA-band trading strategy with risk management, stop-loss, portfolio % trades, and configurable parameters.
 
-### Requirements
-- Node.js v18+ and npm or pnpm or yarn
-- Git
-- Blockfrost account and project id
-- TapTools API key
-- A funded Cardano address and private key for live trading
-- PM2 for process management in production
+## Features
 
-### Install
+- **EMA Band Strategy** – buy low, sell high around a moving average band.  
+- **DEX Aggregation** – always gets the best swap price via Minswap Aggregator.  
+- **Backtesting** – test strategies with TapTools data before risking real funds.  
+- **Risk Controls** – slippage guard, fee caps, min trade size, max % allocation.  
+- **Dry Mode** – test without sending real transactions.  
+- **PM2 Support** – manage bots easily with multiple market pairs.  
+- **Logging** – CSV trade logs for PnL tracking.
+
+---
+
+## Prerequisites
+
+- Node.js 18+  
+- pnpm (preferred) or npm  
+- A funded **Cardano wallet private key** (enterprise key recommended).  
+- Blockfrost API key (for your chosen network).  
+- TapTools API key (for backtesting).  
+
+---
+
+## Installation
+
+Clone and install dependencies:
+
 ```bash
 git clone https://github.com/pbwebdev/cardano-trading-bot.git
 cd cardano-trading-bot
-pnpm install   # or: npm install / yarn install
+pnpm install
 ```
 
-### Configuration overview
-The project uses environment files so you can safely separate global settings from per-pair and testing configs.
+---
 
-#### Global `.env`
-Shared variables such as network and API keys.
-```ini
-DRY_RUN=true
-ONLY_VERIFIED=true
+## Configuration
 
-NETWORK=Mainnet
-BLOCKFROST_PROJECT_ID=your_blockfrost_project_id
-TAPTOOLS_API_KEY=your_taptools_api_key
-```
+All configuration is done via `.env` files.  
+Examples are provided:  
 
-#### Pair-specific `.env` for live trading
-Example for ADA-USDM: `.env.ada-usdm`
-```ini
-LOG=fills.ada-usdm.csv
-CENTER_FILE=.band-center.ada-usdm.json
+- `env.example` – general template  
+- `env.example.ada-strike` – trading ADA/STRIKE example  
+- `env.example.dry-mode` – safe test mode  
 
-TOKEN_A=ADA
-TOKEN_B=USDM
-AMOUNT_A_DEC=100
-AMOUNT_B_DEC=50
+Copy and edit one:
 
-SLIPPAGE_PCT=0.35
-FEE_CAP_PCT=0.20
-BAND_BPS=35
-BAND_ALPHA=0.20
-EDGE_BPS=3
-
-COOLDOWN_MS=45000
-POLL_MS=22000
-
-MIN_NOTIONAL_OUT=30
-MAX_PCT_A=15
-MAX_PCT_B=15
-MIN_TRADE_A_DEC=10
-MIN_TRADE_B_DEC=5
-RESERVE_ADA_DEC=250
-```
-
-### Dry mode, backtesting and sweeps
-For testing and research, keep a dedicated file so you do not pollute live settings. Recommended file name: `.env.dry-mode`. It includes live-like defaults plus backtest and sweep variables. See the full commented example at the end of this README insert.
-
-Key backtest variables used by `src/backtest-taptools.ts`:
-- `BT_INTERVAL`, `BT_MAX_POINTS`, `BT_START_EPOCH`, `BT_END_EPOCH`, `BT_PRICE_IS_B_PER_A`
-- `BT_POOL_FEE_BPS`, `BT_AGG_FEE_BPS`, `BT_COOLDOWN_MS`
-- `BT_START_ADA`, `BT_START_TOKB`
-- `BT_DECISION_EVERY_MS`
-
-Key sweep variables used by `src/backtest-sweep.ts`:
-- `SWEEP_BAND_BPS`, `SWEEP_EDGE_BPS`, `SWEEP_ALPHA`
-- `SWEEP_MAX_PCT_A`, `SWEEP_MAX_PCT_B`, `SWEEP_MIN_TRADE_A`, `SWEEP_MIN_TRADE_B`
-- `SWEEP_MIN_CYCLE_PNL_BPS`, `SWEEP_TRAIL_STOP_BPS`, `SWEEP_HARD_STOP_BPS`
-- `SWEEP_DECISION_EVERY_MS`
-
-### Run the live bot
 ```bash
-# Windows PowerShell
-$env:DOTENV_CONFIG_PATH=".env.ada-usdm"
-npx tsx src/bot-twoway.ts
-
-# macOS or Linux
-export DOTENV_CONFIG_PATH=".env.ada-usdm"
-npx tsx src/bot-twoway.ts
+cp env.example.ada-strike .env.ada-strike
 ```
 
-### Run a backtest
+### Important Parameters
+
+```ini
+# Mode
+DRY_RUN=true                # true = no real trades, false = live trades
+ONLY_VERIFIED=true          # only use verified pools
+
+# Network
+NETWORK=Mainnet             # or Preprod / Preview
+BLOCKFROST_PROJECT_ID=...   # your Blockfrost API key
+TAPTOOLS_API_KEY=...        # your TapTools API key for backtests
+
+# Logging
+LOG=fills.ada-strike.csv    # CSV log file
+CENTER_FILE=.band-center.json
+
+# Token pair
+TOKEN_A=ADA                 # base token
+TOKEN_B=STRIKE              # quote token
+
+# Trade sizing
+AMOUNT_A_DEC=100            # trade amount of token A in decimals
+AMOUNT_B_DEC=50             # trade amount of token B in decimals
+RESERVE_ADA_DEC=250         # ADA kept in wallet, never traded
+
+# Strategy parameters
+SLIPPAGE_PCT=0.35           # max % slippage allowed
+FEE_CAP_PCT=0.25            # max % fees allowed
+BAND_BPS=35                 # band width (basis points)
+BAND_ALPHA=0.20             # EMA smoothing factor
+EDGE_BPS=3                  # edge trigger before trade executes
+
+# Trade frequency
+COOLDOWN_MS=45000           # minimum ms between trades
+POLL_MS=22000               # price check interval
+
+# Risk controls
+MIN_NOTIONAL_OUT=30         # minimum trade output value
+MAX_PCT_A=15                # max % of Token A portfolio in one trade
+MAX_PCT_B=15                # max % of Token B portfolio in one trade
+MIN_TRADE_A_DEC=10          # minimum trade amount of Token A
+MIN_TRADE_B_DEC=5           # minimum trade amount of Token B
+```
+
+---
+
+## Running the Bot
+
+### Dry Run (safe mode)
 ```bash
-# Use the dry mode config
-export DOTENV_CONFIG_PATH=".env.dry-mode"
+$env:DOTENV_CONFIG_PATH=".env.ada-strike"
+npx tsx src/bot.ts
+```
+
+### Live Mode with PM2
+```bash
+pm2 start ecosystem.config.cjs --only bot:ada-strike
+pm2 logs bot:ada-strike
+```
+
+Stop the bot:
+```bash
+pm2 stop bot:ada-strike
+```
+
+---
+
+## Backtesting
+
+Use TapTools data to test strategies.
+
+```bash
+$env:DOTENV_CONFIG_PATH=".env.ada-strike"
 npx tsx src/backtest-taptools.ts
 ```
 
-### Run a parameter sweep
+Run parameter sweeps:
 ```bash
-export DOTENV_CONFIG_PATH=".env.dry-mode"
+$env:DOTENV_CONFIG_PATH=".env.ada-strike"
 npx tsx src/backtest-sweep.ts
 ```
-- The sweep script expands every combination from the comma separated `SWEEP_*` ranges and writes a consolidated CSV of results.
 
-### PM2 process management
-```bash
-npm i -g pm2
-pm2 start ecosystem.config.cjs
-pm2 status
-pm2 logs
-pm2 restart <id|name>
-pm2 stop <id|name>
+Results are logged to CSV for analysis.
+
+---
+
+## Project Structure
+
+```
+src/
+  backtest-sweep.ts        # Backtest sweeps
+  backtest-taptools.ts     # TapTools backtest
+  bot.ts                   # Main trading bot
+  clients/                 # Blockfrost, aggregator, wallet clients
+  execution/               # Trade execution
+  persistence/             # State management
+  strategy/                # EMA-band strategy
+  util/                    # Logging, formatting, helpers
 ```
 
-### Logs and persistent state
-- Trade fills: `fills.<pair>.csv`
-- Band centre state: `.band-center.<pair>.json`
-- Backtest results: CSV per run
-- Sweep results: consolidated CSV
+---
 
-### Tips
-- Start with `DRY_RUN=true` to validate routing, logging and constraints.
-- Set `ONLY_VERIFIED=true` to prefer deeper liquidity.
-- Keep `RESERVE_ADA_DEC` high enough for fees and routing.
-- Align `DECISION_EVERY_MS`, `BT_DECISION_EVERY_MS` and `SWEEP_DECISION_EVERY_MS` when validating decision cadence.
-- Maintain separate env files per pair and for dry mode.
+## Notes
+
+- Always start in **DRY_RUN mode** before going live.  
+- Adjust `.env` parameters to suit your risk appetite.  
+- Keep a reserve of ADA to pay for transaction fees.  
+- You can run multiple bots with different `.env` configs using PM2.  
+
+---
+
+## License
+
+MIT
