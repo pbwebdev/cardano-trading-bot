@@ -56,7 +56,7 @@ export async function runBot() {
         candleH: candleMs ? (candleMs / 3_600_000).toFixed(2) : "0",
         decisionH: decisionEvery ? (decisionEvery / 3_600_000).toFixed(2) : "0",
     });
-    
+
     // State
     let band = loadCenter(cfg.CENTER_FILE);
     let center = band?.center ?? null;

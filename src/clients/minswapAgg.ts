@@ -1,6 +1,7 @@
 // --- filepath: src/clients/minswapAgg.ts ---
 import axios from "axios";
 import type { AppConfig } from "../config.js";
+import { floorToDp } from "../util/units.js";
 import type { Unit, TokenInfo } from "../types.js";
 
 const HEX_RE = /^[0-9a-f]+$/i;
@@ -38,6 +39,15 @@ export async function resolveUnit(cfg: AppConfig, u: string, onlyVerified = true
     return chosen.token_id as string;
 }
 
+
+export async function getTokenDecimals(cfg: AppConfig, unit: Unit): Promise<number> {
+    const token_id = await resolveUnit(cfg, unit, cfg.ONLY_VERIFIED_BOOL);
+    if (token_id === "lovelace") return 6;
+    const infos = await getTokenInfos(cfg, [token_id]);
+    const dec = Number(infos?.[0]?.decimals ?? 6);
+    return Number.isFinite(dec) && dec >= 0 && dec <= 18 ? dec : 6;
+}
+
 export async function getTokenInfos(cfg: AppConfig, assets: string[]): Promise<TokenInfo[]> {
     const a = (assets || []).filter(Boolean);
     if (!a.length) return [];
@@ -60,6 +70,11 @@ export async function resolvePairVerbose(cfg: AppConfig, a: string, b: string) {
         a: aId === "lovelace" ? adaInfo : (infoMap[aId] ?? { token_id: aId }),
         b: bId === "lovelace" ? adaInfo : (infoMap[bId] ?? { token_id: bId }),
     };
+}
+
+export async function floorAmountForUnitDecimal(cfg: AppConfig, unit: Unit, amountDec: number | string): Promise<string> {
+    const dp = await getTokenDecimals(cfg, unit);
+    return floorToDp(amountDec, dp);
 }
 
 export async function getMidPrice(cfg: AppConfig, unitA: Unit, unitB: Unit): Promise<number> {
@@ -95,7 +110,7 @@ export async function estimateSwap(
 
     const url = `${cfg.AGG_URL}/estimate`;
     const { data } = await axios.post(url, {
-        amount: String(inAmountDec),
+        amount: await floorAmountForUnitDecimal(cfg, inUnit, inAmountDec),
         token_in,
         token_out,
         slippage: cfg.SLIPPAGE_PCT,

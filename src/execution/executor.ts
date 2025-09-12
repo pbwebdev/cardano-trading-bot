@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 
 import type { AppConfig } from "../config.js";
 import type { Unit } from "../types.js";
-import { estimateSwap, resolveUnit } from "../clients/minswapAgg.js";
+import { estimateSwap, resolveUnit, floorAmountForUnitDecimal } from "../clients/minswapAgg.js";
 import { log } from "../util/logger.js";
 
 export async function simulateOrExecute(
@@ -39,7 +39,7 @@ export async function simulateOrExecute(
         sender: senderAddress,
         min_amount_out: String(est.min_amount_out),
         estimate: {
-            amount: String(inAmountDec),
+            amount: await floorAmountForUnitDecimal(cfg, inUnit, inAmountDec),
             token_in,
             token_out,
             slippage: cfg.SLIPPAGE_PCT,
