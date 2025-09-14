@@ -8,6 +8,8 @@
 /.idea
 logs/
 /logs/
+data/
+/data/
 
 # secrets
 .env
