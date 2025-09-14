@@ -1,4 +1,7 @@
-# Cardano Trading Bot
+# Waveband Cardano Trading Bot
+
+![Waveband Cardano Trading Bot](https://raw.githubusercontent.com/pbwebdev/cardano-trading-bot/refs/heads/master/waveband-cardano-crypto-trading-bot-logo.png)
+
 
 Automate trading on the Cardano blockchain using Minswap’s Aggregator API for the best swap prices and TapTools API for backtesting.  
 This bot implements an EMA-band trading strategy with risk management, stop-loss, portfolio % trades, and configurable parameters.
