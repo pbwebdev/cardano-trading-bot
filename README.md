@@ -169,3 +169,5 @@ src/
 ## License
 
 MIT
+
+Create by the team at Mesh With Us, [Cardano Blockchain Development, Gold Coast](https://meshwithus.com.au/services/cardano-blockchain-development-gold-coast/).
